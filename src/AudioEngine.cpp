@@ -150,13 +150,30 @@ bool AudioEngine::startSpeaker() {
   bool ok = M5.Speaker.begin();
   if (ok) {
 #if defined(INTERCOM_BOARD_STICKS3)
-    // M5Unified starts the StickS3 ES8311 at 0xBF (0 dB). Add 6 dB so it is
-    // audible at normal listening distance. 0xCB is the same value M5Unified
-    // uses on the StopWatch (0.5 dB per step above 0xBF); higher gains clip
-    // the DAC digitally without getting any louder.
-    M5.In_I2C.writeRegister8(0x18, 0x32, 0xCB, 100000);
+    // M5Unified starts the StickS3 ES8311 at 0xBF (0 dB). Keep at 0 dB (0xBF)
+    // instead of +6 dB (0xCB) to minimize peak speaker current and avoid brownout
+    // on battery. Digital magnification (8x) provides sufficient headroom for
+    // speech; analog gain reduction cuts peak power by ~75% vs +6dB.
+    M5.In_I2C.writeRegister8(0x18, 0x32, 0xBF, 100000);
+
+    // Battery-aware volume limiting: read voltage and cap max volume if low.
+    // M5.Power.getBatteryVoltage() returns mV. Below 3.3V, limit to ~70% volume.
+    uint16_t batMv = M5.Power.getBatteryVoltage();
+    if (batMv > 0 && batMv < kBrownoutVoltageMv) {
+      _maxAllowedVolume = kLowBatteryMaxVolume;
+      Serial.printf("[audio] low battery %u mV, limiting volume to %u\n", batMv, _maxAllowedVolume);
+    } else {
+      _maxAllowedVolume = 255;
+    }
 #endif
-    M5.Speaker.setVolume(_volume);
+    // Soft-start: begin at zero volume and ramp up over the first few frames
+    // to prevent brownout on StickS3 when the first packet arrives at high volume.
+    _softStartRemaining = kSoftStartFrames;
+    // First-frame mute: heavily attenuate first N frames to suppress transients
+    // (button clicks) even if soft-start was interrupted by rapid restarts.
+    _firstFrameMuteRemaining = kFirstFrameMuteFrames;
+    _volume = 0;
+    M5.Speaker.setVolume(0);
     _speakerRunning.store(true);
     _lastSpeakerTryMs = 0;
   } else {
@@ -173,7 +190,12 @@ void AudioEngine::stopSpeaker() {
   M5.Speaker.end();
   _speakerRunning.store(false);
   _lastSpeakerTryMs = 0;
+  _lastSpeakerStopMs = millis();  // Record stop time for minimum restart interval
   _playbackLevel.store(0.0f);
+  _softStartRemaining = 0;
+  _firstFrameMuteRemaining = 0;
+  _volume = _targetVolume;
+  _maxAllowedVolume = 255;
   for (size_t i = 0; i < kPlayBufferCount; ++i) {
     _playBusy[i].store(false);
   }
@@ -187,6 +209,13 @@ bool AudioEngine::ensureSpeaker() {
     return true;
   }
   if (!_playbackEnabled.load() || _captureActive.load()) {
+    return false;
+  }
+
+  // Minimum restart interval: prevent rapid speaker on/off cycles from
+  // AtomS3R rapid clicking which defeats soft-start and causes brownout.
+  if (_lastSpeakerStopMs != 0 &&
+      (uint32_t)(millis() - _lastSpeakerStopMs) < kMinRestartIntervalMs) {
     return false;
   }
 
@@ -258,7 +287,47 @@ bool AudioEngine::playFrame(const int16_t* samples, size_t count) {
     memset(slot + count, 0, (kPlayBufferSamples - count) * sizeof(int16_t));
   }
 
+  // First-frame mute: heavily attenuate first N frames ALWAYS to suppress
+  // transients (button clicks on AtomS3R) even if soft-start was interrupted
+  // by rapid restarts. This runs independently of soft-start volume ramp.
+  if (_firstFrameMuteRemaining > 0) {
+    --_firstFrameMuteRemaining;
+    // 1/8 amplitude for frame 1, 2/8 for frame 2, etc.
+    uint16_t scaleNumerator = kFirstFrameMuteFrames - _firstFrameMuteRemaining;
+    uint16_t scaleDenominator = kFirstFrameMuteFrames * 4;  // Extra 4x attenuation
+    for (size_t i = 0; i < count; ++i) {
+      slot[i] = (int16_t)((int32_t)slot[i] * scaleNumerator / scaleDenominator);
+    }
+  }
+
+  // Soft-start: also attenuate the first few frames at the sample level to
+  // protect against loud transients (e.g. button clicks) even if volume ramp
+  // is interrupted by rapid start/stop cycles.
+  if (_softStartRemaining > 0) {
+    uint8_t framesDone = kSoftStartFrames - _softStartRemaining;
+    // Linear ramp: 1/15, 2/15, 3/15... of full amplitude
+    uint16_t scaleNumerator = framesDone;
+    uint16_t scaleDenominator = kSoftStartFrames;
+    for (size_t i = 0; i < count; ++i) {
+      slot[i] = (int16_t)((int32_t)slot[i] * scaleNumerator / scaleDenominator);
+    }
+  }
+
   _playbackLevel.store(pcmLevel(slot, count));
+
+  // Soft-start: ramp volume up over the first kSoftStartFrames frames to avoid
+  // brownout on StickS3 when the first packet arrives at high volume.
+  if (_softStartRemaining > 0) {
+    --_softStartRemaining;
+    // Use the lower of target volume and battery-limited max volume.
+    uint8_t effectiveTarget = _targetVolume < _maxAllowedVolume ? _targetVolume : _maxAllowedVolume;
+    uint8_t nextVolume = (effectiveTarget * (kSoftStartFrames - _softStartRemaining)) / kSoftStartFrames;
+    if (nextVolume != _volume) {
+      _volume = nextVolume;
+      M5.Speaker.setVolume(_volume);
+    }
+  }
+
   bool queued = M5.Speaker.playRaw(slot, kPlayBufferSamples, kSampleRate, false, 1, 0, false);
   if (!queued) {
     _playBusy[index].store(false);
@@ -272,6 +341,11 @@ void AudioEngine::stopPlayback() {
     M5.Speaker.end();
     _speakerRunning.store(false);
   }
+  _lastSpeakerStopMs = millis();  // Record stop time for minimum restart interval
+  _softStartRemaining = 0;
+  _firstFrameMuteRemaining = 0;
+  _volume = _targetVolume;
+  _maxAllowedVolume = 255;
   for (size_t i = 0; i < kPlayBufferCount; ++i) {
     _playBusy[i].store(false);
   }
@@ -279,8 +353,15 @@ void AudioEngine::stopPlayback() {
 }
 
 void AudioEngine::setVolume(uint8_t volume) {
-  _volume = volume;
-  M5.Speaker.setVolume(volume);
+  _targetVolume = volume;
+  // If soft-start is not active, apply immediately (capped by battery limit).
+  if (_softStartRemaining == 0) {
+    uint8_t effectiveVolume = volume < _maxAllowedVolume ? volume : _maxAllowedVolume;
+    if (_volume != effectiveVolume) {
+      _volume = effectiveVolume;
+      M5.Speaker.setVolume(effectiveVolume);
+    }
+  }
 }
 
 void AudioEngine::onBufferReleased(void* args, const void* data, uint8_t channel) {

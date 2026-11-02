@@ -43,6 +43,17 @@ class AudioEngine {
   static constexpr size_t kPlayBufferCount = 6;
   static constexpr size_t kPlayBufferSamples = kFrameSamples;
   static constexpr uint32_t kSpeakerRetryMs = 500;
+  // Soft-start: ramp volume over ~100 ms (5 frames @ 20 ms) to avoid
+  // brownout on StickS3 when the first packet arrives at high volume.
+  static constexpr uint8_t kSoftStartFrames = 15;
+   // First-frame protection: always heavily attenuate first N frames to
+   // suppress transients (button clicks) even if soft-start was interrupted.
+   static constexpr uint8_t kFirstFrameMuteFrames = 2;
+   // Minimum time between speaker restarts to prevent rapid cycling.
+   static constexpr uint32_t kMinRestartIntervalMs = 500;
+   // Battery-aware volume limiting: below this voltage (mV), reduce max volume.
+   static constexpr uint16_t kBrownoutVoltageMv = 3300;  // 3.3V - safe margin above brownout
+   static constexpr uint8_t kLowBatteryMaxVolume = 180;  // ~70% of 255
 
   bool startSpeaker();
   void stopSpeaker();
@@ -53,8 +64,13 @@ class AudioEngine {
   int16_t _playBuffers[kPlayBufferCount][kPlayBufferSamples] = {};
   std::atomic<bool> _playBusy[kPlayBufferCount] = {};
   uint8_t _volume = kDefaultVolume;
+  uint8_t _targetVolume = kDefaultVolume;
+  uint8_t _softStartRemaining = 0;
+   uint8_t _firstFrameMuteRemaining = 0;
+    uint8_t _maxAllowedVolume = 255;  // Capped by battery voltage
+   uint32_t _lastSpeakerStopMs = 0;  // For minimum restart interval
 
-  std::atomic<bool> _captureActive{false};
+   std::atomic<bool> _captureActive{false};
   std::atomic<bool> _playbackEnabled{true};
   std::atomic<bool> _micRunning{false};
   std::atomic<bool> _speakerRunning{false};

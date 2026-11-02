@@ -1,0 +1,8 @@
+{
+  "name": "IntercomShared",
+  "version": "1.0.0",
+  "description": "Shared audio, ESP-NOW, ADPCM, and UI code for the AtomS3R/StickS3 intercom",
+  "keywords": "esp32, esp-now, intercom, m5stack, adpcm",
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}

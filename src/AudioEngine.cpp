@@ -28,8 +28,12 @@ bool AudioEngine::begin() {
 
   auto spk = M5.Speaker.config();
   spk.sample_rate = kSampleRate;
-  // Keep the board-specific magnification from M5Unified (1 for the Atomic
-  // Echo base and StickS3). Overriding it with a large value clips playback.
+  // M5Unified gives StickS3 magnification 1 while its ES8311 DAC runs at 0 dB,
+  // which makes it about 18 dB quieter than the other ES8311 boards. In stereo
+  // at 16 kHz, magnification 8 is unity digital gain (no extra clipping).
+#if defined(INTERCOM_BOARD_STICKS3)
+  spk.magnification = 8;
+#endif
   spk.dma_buf_len = kFrameSamples;
   spk.dma_buf_count = 8;
   spk.task_priority = 2;
@@ -145,6 +149,13 @@ bool AudioEngine::startSpeaker() {
   M5.Speaker.setBufferReleaseCallback(this, &AudioEngine::onBufferReleased);
   bool ok = M5.Speaker.begin();
   if (ok) {
+#if defined(INTERCOM_BOARD_STICKS3)
+    // M5Unified starts the StickS3 ES8311 at 0xBF (0 dB). Add 6 dB so it is
+    // audible at normal listening distance. 0xCB is the same value M5Unified
+    // uses on the StopWatch (0.5 dB per step above 0xBF); higher gains clip
+    // the DAC digitally without getting any louder.
+    M5.In_I2C.writeRegister8(0x18, 0x32, 0xCB, 100000);
+#endif
     M5.Speaker.setVolume(_volume);
     _speakerRunning.store(true);
     _lastSpeakerTryMs = 0;

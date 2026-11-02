@@ -35,7 +35,11 @@ constexpr uint16_t kFrameBytes = 160;    // IMA ADPCM, 2 samples per byte
 constexpr uint32_t kFrameMs = 20;
 
 constexpr uint8_t kChannel = INTERCOM_CHANNEL;
-constexpr uint8_t kDefaultVolume = 65;
+// Default local volume: half of the speaker's full scale.
+constexpr uint8_t kDefaultVolumePercent = 50;
+constexpr uint8_t kDefaultVolume =
+    (uint8_t)((uint16_t)255 * kDefaultVolumePercent / 100);
+constexpr uint8_t kVolumeStepPercent = 10;
 
 constexpr uint32_t kHelloIntervalMs = 1000;
 constexpr uint32_t kPeerTimeoutMs = 5000;

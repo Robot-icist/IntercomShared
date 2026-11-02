@@ -98,8 +98,13 @@ void IntercomUi::drawHeader(lgfx::LGFXBase& g, const UiState& s) {
 void IntercomUi::drawState(lgfx::LGFXBase& g, const UiState& s) {
   g.setTextDatum(lgfx::textdatum_t::top_left);
   g.setTextSize(2);
-  g.setTextColor(stateColor(s.state));
-  g.drawString(stateName(s.state), 4, 18);
+  if (s.mode == Mode::Volume) {
+    g.setTextColor(TFT_YELLOW);
+    g.drawString("VOLUME", 4, 18);
+  } else {
+    g.setTextColor(stateColor(s.state));
+    g.drawString(stateName(s.state), 4, 18);
+  }
 
   g.setTextDatum(lgfx::textdatum_t::top_right);
   g.setTextSize(1);
@@ -170,7 +175,13 @@ void IntercomUi::drawInfo(lgfx::LGFXBase& g, const UiState& s) {
   g.drawString(left, 4, y);
 
   g.setTextDatum(lgfx::textdatum_t::top_right);
-  g.drawString("ESP-NOW", _w - 4, y);
+  if (s.mode == Mode::Volume) {
+    char volume[12];
+    snprintf(volume, sizeof(volume), "VOL %u%%", (unsigned)s.volume);
+    g.drawString(volume, _w - 4, y);
+  } else {
+    g.drawString("ESP-NOW", _w - 4, y);
+  }
 }
 
 void IntercomUi::drawFooter(lgfx::LGFXBase& g, const UiState& s) {
@@ -179,7 +190,14 @@ void IntercomUi::drawFooter(lgfx::LGFXBase& g, const UiState& s) {
 
   char line1[24];
   char line2[24];
-  if (s.mode == Mode::Live) {
+  if (s.mode == Mode::Volume) {
+    snprintf(line1, sizeof(line1), "VOL %u%%", (unsigned)s.volume);
+#if defined(INTERCOM_BOARD_STICKS3)
+    snprintf(line2, sizeof(line2), "A+ B- 2X NEXT");
+#else
+    snprintf(line2, sizeof(line2), "CLK+ HLD- 2X");
+#endif
+  } else if (s.mode == Mode::Live) {
     snprintf(line1, sizeof(line1), "HOLD A = TALK");
     snprintf(line2, sizeof(line2), "2X A = MODE");
   } else if (s.state == State::Rec) {

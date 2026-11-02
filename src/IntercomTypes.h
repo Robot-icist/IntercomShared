@@ -9,8 +9,9 @@
 namespace intercom {
 
 enum class Mode : uint8_t {
-  Live = 0,  // push-to-talk while the button is held
-  Clip = 1,  // click to record, click again to send the clip
+  Live = 0,    // push-to-talk while the button is held
+  Clip = 1,    // click to record, click again to send the clip
+  Volume = 2,  // local speaker volume
 };
 
 enum class State : uint8_t {
@@ -69,12 +70,20 @@ struct UiState {
   float rxLevel = 0.0f;
   uint32_t recordingMs = 0;
   uint32_t sendProgress = 0;  // 0..100
+  uint8_t volume = 50;         // local speaker volume, 0..100
   uint32_t sampleRate = 16000;
   uint8_t channel = 1;
 };
 
 inline const char* modeName(Mode mode) {
-  return mode == Mode::Clip ? "CLIP" : "LIVE";
+  switch (mode) {
+    case Mode::Clip:
+      return "CLIP";
+    case Mode::Volume:
+      return "VOL";
+    default:
+      return "LIVE";
+  }
 }
 
 inline const char* stateName(State state) {

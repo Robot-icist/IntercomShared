@@ -1,5 +1,7 @@
 #include "IntercomApp.h"
 
+#include <Preferences.h>
+
 #include <algorithm>
 #include <cstring>
 
@@ -32,6 +34,18 @@ bool IntercomApp::begin() {
     Serial.println("[app] audio init failed");
     return false;
   }
+
+  Preferences prefs;
+  if (prefs.begin("intercom", true)) {
+    uint8_t stored = prefs.getUChar("volume", kDefaultVolumePercent);
+    prefs.end();
+    if (stored <= 100) {
+      _volume = stored;
+    }
+  }
+  _audio.setVolume((uint8_t)((uint16_t)_volume * 255 / 100));
+  Serial.printf("[app] volume %u%%\n", (unsigned)_volume);
+
   if (!_link.begin()) {
     Serial.println("[app] link init failed");
     return false;
@@ -117,15 +131,30 @@ void IntercomApp::handleButtons() {
     if (_recording.load()) {
       cancelClipRecord();
     } else {
-      toggleMode();
+      cycleMode();
     }
   }
 
 #if defined(INTERCOM_BOARD_STICKS3)
   if (M5.BtnB.wasClicked()) {
-    toggleMode();
+    if (_mode.load() == Mode::Volume) {
+      changeVolume(-(int)kVolumeStepPercent);
+    } else {
+      cycleMode();
+    }
   }
 #endif
+
+  if (_mode.load() == Mode::Volume) {
+    // One-button AtomS3R: click up, hold down. The StickS3 also has BtnB.
+    if (M5.BtnA.wasSingleClicked()) {
+      changeVolume((int)kVolumeStepPercent);
+    }
+    if (M5.BtnA.wasHold()) {
+      changeVolume(-(int)kVolumeStepPercent);
+    }
+    return;
+  }
 
   if (_mode.load() == Mode::Live) {
     if (M5.BtnA.wasPressed()) {
@@ -283,15 +312,48 @@ void IntercomApp::sendClipStep() {
   _sendProgress.store((uint32_t)((_clipSendPos * 100) / total));
 }
 
-void IntercomApp::toggleMode() {
+void IntercomApp::cycleMode() {
   if (_recording.load() || _sendingClip.load() || _txActive.load()) {
     return;
   }
 
-  Mode next = (_mode.load() == Mode::Live) ? Mode::Clip : Mode::Live;
+  Mode next = _mode.load();
+  switch (next) {
+    case Mode::Live:
+      next = Mode::Clip;
+      break;
+    case Mode::Clip:
+      next = Mode::Volume;
+      break;
+    default:
+      next = Mode::Live;
+      break;
+  }
   _mode.store(next);
   _state.store(State::Idle);
   Serial.printf("[app] mode %s\n", modeName(next));
+}
+
+void IntercomApp::changeVolume(int delta) {
+  int next = (int)_volume + delta;
+  if (next > 100) {
+    next = 0;
+  } else if (next < 0) {
+    next = 100;
+  }
+
+  _volume = (uint8_t)next;
+  _audio.setVolume((uint8_t)((uint16_t)_volume * 255 / 100));
+  saveVolume();
+  Serial.printf("[app] volume %u%%\n", (unsigned)_volume);
+}
+
+void IntercomApp::saveVolume() {
+  Preferences prefs;
+  if (prefs.begin("intercom", false)) {
+    prefs.putUChar("volume", _volume);
+    prefs.end();
+  }
 }
 
 void IntercomApp::setPlayback(bool enabled) {
@@ -340,6 +402,7 @@ void IntercomApp::updateUi() {
   s.rxLevel = _rxLevel.load();
   s.recordingMs = _recordingMs.load();
   s.sendProgress = _sendProgress.load();
+  s.volume = _volume;
   s.sampleRate = kSampleRate;
   s.channel = kChannel;
   _ui.render(s);

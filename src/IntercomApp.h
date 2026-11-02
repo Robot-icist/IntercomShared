@@ -35,7 +35,9 @@ class IntercomApp {
   void stopClipRecordAndSend();
   void cancelClipRecord();
   void sendClipStep();
-  void toggleMode();
+  void cycleMode();
+  void changeVolume(int delta);
+  void saveVolume();
   void setPlayback(bool enabled);
   void setError();
   void updateState();
@@ -64,6 +66,7 @@ class IntercomApp {
   std::atomic<float> _micLevel{0.0f};
   std::atomic<float> _rxLevel{0.0f};
   std::atomic<int> _battery{-1};
+  uint8_t _volume = kDefaultVolumePercent;
   std::atomic<uint32_t> _recordingMs{0};
   std::atomic<uint32_t> _sendProgress{0};
 

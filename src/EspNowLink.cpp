@@ -6,6 +6,7 @@ namespace intercom {
 namespace {
 
 constexpr uint8_t kBroadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+constexpr uint32_t kPeerAddRetryMs = 500;
 EspNowLink* g_link = nullptr;
 
 }  // namespace
@@ -70,7 +71,8 @@ bool EspNowLink::send(const uint8_t* data, size_t len) {
   uint8_t dst[6];
   bool peer = false;
   if (_peerMutex && xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-    peer = _hasPeer && (millis() - _lastPeerMs.load() < kPeerTimeoutMs);
+    peer = _hasPeer && _peerReady.load() &&
+           (millis() - _lastPeerMs.load() < kPeerTimeoutMs);
     memcpy(dst, _peerMac, sizeof(dst));
     xSemaphoreGive(_peerMutex);
   }
@@ -168,7 +170,7 @@ void EspNowLink::handlePacket(const uint8_t* src, int8_t rssi, const uint8_t* da
     }
     const HelloPayload* payload =
         (const HelloPayload*)(data + sizeof(PacketHeader));
-    addPeer(src);
+    notePeer(src);
     updatePeerName(payload->name);
     _peerRssi.store(rssi);
     _lastPeerMs.store(millis());
@@ -179,7 +181,7 @@ void EspNowLink::handlePacket(const uint8_t* src, int8_t rssi, const uint8_t* da
     if (header->payloadLen == 0) {
       return;
     }
-    addPeer(src);
+    notePeer(src);
     _peerRssi.store(rssi);
     _lastPeerMs.store(millis());
 
@@ -194,31 +196,83 @@ void EspNowLink::handlePacket(const uint8_t* src, int8_t rssi, const uint8_t* da
   }
 }
 
-void EspNowLink::addPeer(const uint8_t* mac) {
-  if (!_peerMutex || xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+void EspNowLink::notePeer(const uint8_t* mac) {
+  if (!mac || !_peerMutex || xSemaphoreTake(_peerMutex, 0) != pdTRUE) {
     return;
   }
 
   if (!_hasPeer || memcmp(_peerMac, mac, sizeof(_peerMac)) != 0) {
     memcpy(_peerMac, mac, sizeof(_peerMac));
+    memcpy(_pendingMac, mac, sizeof(_pendingMac));
     _hasPeer = true;
-
-    esp_now_peer_info_t peer = {};
-    memcpy(peer.peer_addr, mac, sizeof(_peerMac));
-    peer.channel = kChannel;
-    peer.ifidx = WIFI_IF_STA;
-    peer.encrypt = false;
-    esp_now_add_peer(&peer);
+    _pendingPeer = true;
+    _peerReady.store(false);
   }
 
   xSemaphoreGive(_peerMutex);
+}
+
+bool EspNowLink::poll() {
+  if (!_peerMutex) {
+    return false;
+  }
+
+  uint8_t mac[6];
+  bool pending = false;
+  if (xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+    return false;
+  }
+  if (_pendingPeer) {
+    memcpy(mac, _pendingMac, sizeof(mac));
+    _pendingPeer = false;
+    pending = true;
+  }
+  xSemaphoreGive(_peerMutex);
+
+  if (!pending) {
+    return false;
+  }
+
+  const uint32_t now = millis();
+  if (_lastPeerAddMs != 0 &&
+      (uint32_t)(now - _lastPeerAddMs) < kPeerAddRetryMs) {
+    if (xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      _pendingPeer = true;
+      xSemaphoreGive(_peerMutex);
+    }
+    return false;
+  }
+
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, mac, sizeof(mac));
+  peer.channel = kChannel;
+  peer.ifidx = WIFI_IF_STA;
+  peer.encrypt = false;
+
+  esp_err_t err = esp_now_add_peer(&peer);
+  if (err == ESP_OK || err == ESP_ERR_ESPNOW_EXIST) {
+    _peerReady.store(true);
+    _lastPeerAddMs = 0;
+    return true;
+  }
+
+  // Try again later instead of silently staying on broadcast forever.
+  _lastPeerAddMs = now;
+  Serial.printf("[espnow] peer add failed: %d\n", (int)err);
+  if (xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    memcpy(_pendingMac, mac, sizeof(_pendingMac));
+    _pendingPeer = true;
+    xSemaphoreGive(_peerMutex);
+  }
+  return false;
 }
 
 void EspNowLink::updatePeerName(const char* name) {
   if (!name) {
     return;
   }
-  if (!_peerMutex || xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+  // Called from the Wi-Fi receive callback: never block there.
+  if (!_peerMutex || xSemaphoreTake(_peerMutex, 0) != pdTRUE) {
     return;
   }
   strncpy(_peerName, name, sizeof(_peerName) - 1);

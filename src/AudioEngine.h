@@ -28,6 +28,10 @@ class AudioEngine {
 
   void setPlaybackEnabled(bool enabled);
   bool playbackEnabled() const { return _playbackEnabled.load(); }
+  // Starts the speaker from the caller's task. M5Unified codec/I2S setup must
+  // stay on the same task as M5.update()/battery polling, so the application
+  // calls this from its main loop. Never start the speaker from the audio task.
+  bool ensureSpeaker();
   bool playFrame(const int16_t* samples, size_t count);
   void stopPlayback();
   void setVolume(uint8_t volume);
@@ -38,6 +42,7 @@ class AudioEngine {
  private:
   static constexpr size_t kPlayBufferCount = 6;
   static constexpr size_t kPlayBufferSamples = kFrameSamples;
+  static constexpr uint32_t kSpeakerRetryMs = 500;
 
   bool startSpeaker();
   void stopSpeaker();
@@ -53,6 +58,7 @@ class AudioEngine {
   std::atomic<bool> _playbackEnabled{true};
   std::atomic<bool> _micRunning{false};
   std::atomic<bool> _speakerRunning{false};
+  uint32_t _lastSpeakerTryMs = 0;
   std::atomic<float> _captureLevel{0.0f};
   std::atomic<float> _playbackLevel{0.0f};
 };

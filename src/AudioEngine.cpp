@@ -37,6 +37,10 @@ bool AudioEngine::begin() {
   M5.Speaker.config(spk);
   M5.Speaker.setVolume(_volume);
 
+  // The speaker is started from ensureSpeaker() on the application task, once
+  // the UI is up. Starting it here or, worse, from the playback task, runs the
+  // codec/PMIC I2C setup outside the task that owns M5.update() and the
+  // battery poll, which can take the panel/backlight down on the ESP32-S3.
   return true;
 }
 
@@ -57,9 +61,11 @@ bool AudioEngine::startCapture() {
     return false;
   }
 
-  // The AtomS3R voice base uses one I2S peripheral for both directions. The
-  // microphone cannot start until the speaker driver has released it.
-  if (kSharedAudioPort && _speakerRunning.load()) {
+  // Never run the microphone and the speaker together. The AtomS3R voice base
+  // shares one I2S peripheral, and the StickS3 speaker and microphone are two
+  // I2S masters wired to the same MCLK/BCK/WS pins. Either way, starting the
+  // microphone while the speaker is live corrupts the codec clocking.
+  if (_speakerRunning.load()) {
     stopSpeaker();
   }
 
@@ -125,9 +131,8 @@ size_t AudioEngine::readFrame(int16_t* samples, size_t count) {
 void AudioEngine::setPlaybackEnabled(bool enabled) {
   _playbackEnabled.store(enabled);
   if (!enabled) {
-    // On the StickS3 the speaker task keeps running. Let the already queued
-    // frames drain; the caller simply stops feeding new ones. On the AtomS3R
-    // startCapture() tears the speaker down to free the shared I2S port.
+    // Let the already queued frames drain; the caller stops feeding new ones.
+    // startCapture() tears the speaker down before it starts the microphone.
     _playbackLevel.store(0.0f);
   }
 }
@@ -142,7 +147,9 @@ bool AudioEngine::startSpeaker() {
   if (ok) {
     M5.Speaker.setVolume(_volume);
     _speakerRunning.store(true);
+    _lastSpeakerTryMs = 0;
   } else {
+    _lastSpeakerTryMs = millis();
     Serial.println("[audio] speaker begin failed");
   }
   return ok;
@@ -154,10 +161,41 @@ void AudioEngine::stopSpeaker() {
   }
   M5.Speaker.end();
   _speakerRunning.store(false);
+  _lastSpeakerTryMs = 0;
   _playbackLevel.store(0.0f);
   for (size_t i = 0; i < kPlayBufferCount; ++i) {
     _playBusy[i].store(false);
   }
+}
+
+bool AudioEngine::ensureSpeaker() {
+  if (!_mutex) {
+    return false;
+  }
+  if (_speakerRunning.load()) {
+    return true;
+  }
+  if (!_playbackEnabled.load() || _captureActive.load()) {
+    return false;
+  }
+
+  if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+    return false;
+  }
+  bool ok = _speakerRunning.load();
+  if (!ok && _playbackEnabled.load() && !_captureActive.load()) {
+    // Do not hammer the codec with a fresh I2C probe every loop iteration if
+    // it failed to start (wrong volume, missing base, etc.).
+    if (_lastSpeakerTryMs == 0 ||
+        (uint32_t)(millis() - _lastSpeakerTryMs) >= kSpeakerRetryMs) {
+      ok = startSpeaker();
+      if (!ok) {
+        _lastSpeakerTryMs = millis();
+      }
+    }
+  }
+  xSemaphoreGive(_mutex);
+  return ok;
 }
 
 bool AudioEngine::playFrame(const int16_t* samples, size_t count) {
@@ -165,16 +203,27 @@ bool AudioEngine::playFrame(const int16_t* samples, size_t count) {
     return false;
   }
 
+  // The speaker is owned by the application task. If it is not running yet
+  // (e.g. just after the shared-port microphone was released), drop this frame
+  // instead of re-initialising M5Unified from the audio task.
+  if (!_speakerRunning.load()) {
+    return false;
+  }
+
   if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
     return false;
   }
 
-  if (!_playbackEnabled.load()) {
+  if (!_playbackEnabled.load() || !_speakerRunning.load()) {
     xSemaphoreGive(_mutex);
     return false;
   }
 
-  if (!_speakerRunning.load() && !startSpeaker()) {
+  // playRaw() with an explicit channel waits for a free speaker slot, and the
+  // wait is unbounded if the speaker task ever stalls. A real-time producer
+  // must drop the frame instead of blocking the audio task while holding the
+  // mutex (which would also stall capture start/stop on the main task).
+  if (M5.Speaker.isPlaying(0) >= 2) {
     xSemaphoreGive(_mutex);
     return false;
   }

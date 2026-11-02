@@ -24,6 +24,11 @@ class EspNowLink {
   bool send(const uint8_t* data, size_t len);
   bool sendHello(const char* name, uint8_t battery, Mode mode);
 
+  // Adds a peer discovered by the receive callback. ESP-NOW's peer table must
+  // not be modified from inside the Wi-Fi receive callback, so the application
+  // calls this from its main loop.
+  bool poll();
+
   bool hasPeer() const;
   void peerName(char* out, size_t outSize) const;
   int8_t peerRssi() const { return _peerRssi.load(); }
@@ -34,14 +39,18 @@ class EspNowLink {
  private:
   static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len);
   void handlePacket(const uint8_t* src, int8_t rssi, const uint8_t* data, int len);
-  void addPeer(const uint8_t* mac);
+  void notePeer(const uint8_t* mac);
   void updatePeerName(const char* name);
 
   QueueHandle_t _queue = nullptr;
   SemaphoreHandle_t _peerMutex = nullptr;
   uint8_t _peerMac[6] = {0};
+  uint8_t _pendingMac[6] = {0};
   bool _hasPeer = false;
+  bool _pendingPeer = false;
+  uint32_t _lastPeerAddMs = 0;
   char _peerName[16] = {0};
+  std::atomic<bool> _peerReady{false};
   std::atomic<uint32_t> _lastPeerMs{0};
   std::atomic<int8_t> _peerRssi{0};
   std::atomic<uint32_t> _dropped{0};

@@ -54,12 +54,12 @@ bool IntercomApp::begin() {
   _lastHelloMs = millis();
   sendHello();
 
-  xTaskCreatePinnedToCore(&IntercomApp::txTask, "intercom_tx", 4096, this, 4,
+  xTaskCreatePinnedToCore(&IntercomApp::txTask, "intercom_tx", 6144, this, 4,
                           &_txTask, 0);
-  xTaskCreatePinnedToCore(&IntercomApp::rxTask, "intercom_rx", 4096, this, 3,
+  xTaskCreatePinnedToCore(&IntercomApp::rxTask, "intercom_rx", 6144, this, 3,
                           &_rxTask, 0);
-  xTaskCreatePinnedToCore(&IntercomApp::playTask, "intercom_play", 4096, this, 3,
-                          &_playTask, 0);
+  xTaskCreatePinnedToCore(&IntercomApp::playTask, "intercom_play", 6144, this,
+                          3, &_playTask, 0);
 
   Serial.printf("[app] ready: %u Hz, %u ms frames, %u byte packets\n",
                 (unsigned)kSampleRate, (unsigned)kFrameMs,
@@ -68,8 +68,19 @@ bool IntercomApp::begin() {
 }
 
 void IntercomApp::loop() {
+  // Start the speaker only when there is audio to play, and always from this
+  // task. M5Unified's codec enable callbacks temporarily reconfigure the
+  // shared M5GFX I2C bus; doing that from the playback task races the display,
+  // battery and PMIC accesses on the main task and can blank the panel.
+  if (_playbackEnabled.load() && _jitter.available() > 0) {
+    _audio.ensureSpeaker();
+  }
+
   M5.update();
   handleButtons();
+
+  // Register newly discovered peers outside the Wi-Fi receive callback.
+  _link.poll();
 
   uint32_t now = millis();
 

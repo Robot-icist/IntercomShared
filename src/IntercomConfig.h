@@ -54,15 +54,15 @@ constexpr size_t kMaxPacketSize = 250;
 constexpr uint8_t kMagic = 0x49;  // 'I'
 constexpr uint8_t kVersion = 1;
 
-// The AtomS3R voice base shares one I2S peripheral between mic and speaker, so
-// capture and playback must not run at the same time. The StickS3 uses two
-// separate I2S peripherals and can keep the speaker alive while capturing.
-#if defined(INTERCOM_BOARD_ATOMS3R)
-constexpr bool kSharedAudioPort = true;
+// Neither board may capture and play at the same time. The AtomS3R voice base
+// shares one I2S peripheral between both directions, and the StickS3 uses two
+// I2S peripherals that are wired to the same MCLK/BCK/WS pins, so running both
+// would put two clock masters on the codec.
+
+// Keep the UI sprite in internal RAM on both boards. A PSRAM-backed sprite is
+// pushed to the panel while the jitter buffer is being read from PSRAM by the
+// audio tasks; keeping the sprite internal avoids that contention on the
+// ESP32-S3 and matches the known-good AtomS3R display path.
 constexpr bool kUiUsePsram = false;
-#else
-constexpr bool kSharedAudioPort = false;
-constexpr bool kUiUsePsram = true;
-#endif
 
 }  // namespace intercom

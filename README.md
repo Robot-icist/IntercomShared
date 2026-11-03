@@ -13,7 +13,8 @@ the sibling `IntercomShared` directory via `lib_extra_dirs`.
 | `AdpcmCodec.*` | IMA ADPCM 4-bit encoder/decoder with predictor/index state. |
 | `SampleRing.*` | Thread-safe int16 ring buffer, PSRAM-first allocation, drop-oldest. |
 | `AudioEngine.*` | M5Unified mic/speaker wrapper, half-duplex switching, play buffers. |
-| `EspNowLink.*` | ESP-NOW transport, peer discovery, RSSI, receive queue. |
+| `Transport.*` | ESP-NOW and WiFi transports, peer discovery, transport selection. |
+| `EspNowLink.*` | Legacy ESP-NOW helper, not used by `IntercomApp`. |
 | `IntercomUi.*` | Canvas/sprite UI for 128x128 and 135x240 displays. |
 | `IntercomApp.*` | Application state machine and the TX/RX/playback tasks. |
 
@@ -31,20 +32,38 @@ lost.
 
 | Type | Direction | Payload |
 | --- | --- | --- |
-| `Hello` | Broadcast every 1 s | Battery, mode, device name (16 bytes). |
-| `Audio` | Unicast to known peer, broadcast fallback | ADPCM frame. |
+| `Hello` | Broadcast every 1 s | Battery, mode, unique device name (16 bytes). |
+| `Audio` | Selected peer(s) or broadcast | ADPCM frame. |
+| `Spy` | Unicast to one peer | Live/clip start, stop, done, busy. |
 
 - Fixed Wi-Fi channel `1`.
 - A peer is considered online for 5 s after the last valid packet.
 - Audio uses a PSRAM jitter buffer (~6 s) with a 100 ms prebuffer.
 - Clip mode records up to 15 s to PSRAM and sends it at 1x real time.
+- Device names get a short MAC suffix, so identical boards stay distinguishable.
+- Receive-only peers (no microphone, e.g. the ATOM Lite speaker) set the
+  `ReceiveOnly` Hello flag; spy mode skips them.
+
+## Modes
+
+| Mode | Controls |
+| --- | --- |
+| `LIVE` | Hold A to talk to the selected peer(s). |
+| `CLIP` | Click A to record, click again to send. |
+| `SPY` | Hold A to listen through the selected peer's mic, click A to record a clip on it. Spy requires exactly one peer. |
+| `PEER` | Click A to toggle the highlighted peer, hold A to move through `ALL` and the peer list. |
+| `VOL` | Click A up, hold A down. |
+
+Double-click A cycles modes. `ALL` broadcasts, so every peer hears Live and Clip
+audio, including receive-only speakers. Individual selections can include several
+peers. A spy clip is recorded on the remote unit and played back on the controller.
 
 ## Thread model
 
 | Task | Core | Priority | Responsibility |
 | --- | --- | --- | --- |
 | `txTask` | 0 | 4 | Mic capture, live encode/send, clip record, paced clip send. |
-| `rxTask` | 0 | 3 | ESP-NOW receive, ADPCM decode, jitter-buffer fill. |
+| `rxTask` | 0 | 3 | Receive, ADPCM decode, jitter-buffer fill. |
 | `playTask` | 0 | 3 | Jitter-buffer read, speaker playback. |
 
 `loop()` runs on the Arduino task and handles buttons, peer/battery polling and

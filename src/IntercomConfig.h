@@ -44,6 +44,11 @@ constexpr uint8_t kVolumeStepPercent = 10;
 constexpr uint32_t kHelloIntervalMs = 1000;
 constexpr uint32_t kPeerTimeoutMs = 5000;
 
+// Peer table size and spy safety timeouts.
+constexpr size_t kMaxPeers = 8;
+constexpr uint32_t kSpyLiveMaxMs = 30000;
+constexpr uint32_t kSpyClipTimeoutMs = 40000;
+
 // 6 s of jitter buffer absorbs bursts and the half-duplex turnaround.
 constexpr size_t kJitterCapacity = kSampleRate * 6;
 // 15 s of speech is a comfortable voice clip and fits easily in PSRAM.

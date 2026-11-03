@@ -28,6 +28,9 @@ namespace intercom
 
     // Send audio/hello packet
     virtual bool send(const uint8_t *data, size_t len) = 0;
+    virtual bool sendTo(const uint8_t *addr, uint16_t port, const uint8_t *data,
+                        size_t len) = 0;
+    virtual bool broadcast(const uint8_t *data, size_t len) = 0;
     virtual bool sendHello(const char *name, uint8_t battery, Mode mode) = 0;
 
     // Poll for maintenance (peer management, etc.)
@@ -59,6 +62,9 @@ namespace intercom
     void end() override;
 
     bool send(const uint8_t *data, size_t len) override;
+    bool sendTo(const uint8_t *addr, uint16_t port, const uint8_t *data,
+                size_t len) override;
+    bool broadcast(const uint8_t *data, size_t len) override;
     bool sendHello(const char *name, uint8_t battery, Mode mode) override;
 
     bool poll() override;
@@ -86,6 +92,7 @@ namespace intercom
   private:
     static void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len);
     void handlePacket(const uint8_t *src, int8_t rssi, const uint8_t *data, int len);
+    void queuePacket(const uint8_t *src, int8_t rssi, const uint8_t *data, int len);
     void notePeer(const uint8_t *mac);
     void updatePeerName(const char *name);
 
@@ -119,6 +126,9 @@ namespace intercom
     void end() override;
 
     bool send(const uint8_t *data, size_t len) override;
+    bool sendTo(const uint8_t *addr, uint16_t port, const uint8_t *data,
+                size_t len) override;
+    bool broadcast(const uint8_t *data, size_t len) override;
     bool sendHello(const char *name, uint8_t battery, Mode mode) override;
 
     bool poll() override;
@@ -149,6 +159,8 @@ namespace intercom
     static void udpRecvTask(void *arg);
     void processUDP();
     void sendDiscovery();
+    void queuePacket(const IPAddress &srcIP, uint16_t port, int8_t rssi,
+                     const uint8_t *data, int len);
     void handleDiscoveryResponse(const IPAddress &srcIP, uint16_t port, const uint8_t *data, int len);
     void notePeer(const IPAddress &srcIP, uint16_t port, int8_t rssi);
     void updatePeerName(const char *name);

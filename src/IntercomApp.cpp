@@ -3,6 +3,7 @@
 #include <Preferences.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 namespace intercom {
@@ -27,7 +28,12 @@ bool IntercomApp::begin() {
     return false;
   }
 
-  Serial.printf("\n[app] %s intercom, channel %u\n", INTERCOM_DEVICE_NAME,
+  // Give every unit a unique short name so identical boards can be told apart.
+  uint64_t mac = ESP.getEfuseMac();
+  snprintf(_deviceName, sizeof(_deviceName), "%.10s-%04X", INTERCOM_DEVICE_NAME,
+           (unsigned)(mac & 0xFFFF));
+
+  Serial.printf("\n[app] %s intercom, channel %u\n", _deviceName,
                 (unsigned)kChannel);
 
   if (!_audio.begin()) {
@@ -46,11 +52,17 @@ bool IntercomApp::begin() {
   _audio.setVolume((uint8_t)((uint16_t)_volume * 255 / 100));
   Serial.printf("[app] volume %u%%\n", (unsigned)_volume);
 
+  _peerMutex = xSemaphoreCreateMutex();
+  if (!_peerMutex) {
+    Serial.println("[app] peer mutex allocation failed");
+    return false;
+  }
   // Initialize transport manager (ESP-NOW + WiFi)
-  if (!_transport.begin(INTERCOM_DEVICE_NAME)) {
+  if (!_transport.begin(_deviceName)) {
     Serial.println("[app] transport init failed");
     return false;
   }
+  WiFi.macAddress(_selfMac);
 
   // Register transport change callback for UI updates
   _transport.onTransportChange([this](const char* type) {
@@ -103,8 +115,14 @@ void IntercomApp::loop() {
 
   // Poll transport for peer management, discovery, etc.
   _transport.loop();
+  handlePendingSpy();
 
   uint32_t now = millis();
+
+  if (now - _lastPeerExpireMs >= 1000) {
+    _lastPeerExpireMs = now;
+    expirePeers();
+  }
 
   if (now - _lastHelloMs >= kHelloIntervalMs) {
     _lastHelloMs = now;
@@ -122,6 +140,17 @@ void IntercomApp::loop() {
     if (elapsed >= kClipMaxMs) {
       stopClipRecordAndSend();
     }
+  }
+
+  if (_spyServeLive.load() && now - _spyServeStartMs >= kSpyLiveMaxMs) {
+    stopLiveTx();
+  }
+  if ((_spyRequestLive.load() || _spyRequestClip.load() ||
+       _spyAwaitClip.load()) &&
+      (int32_t)(now - _spyRequestUntilMs) >= 0) {
+    _spyRequestLive.store(false);
+    _spyRequestClip.store(false);
+    _spyAwaitClip.store(false);
   }
 
   updateState();
@@ -153,7 +182,9 @@ void IntercomApp::handleButtons() {
   }
 #endif
 
-  if (_mode.load() == Mode::Volume) {
+  const Mode mode = _mode.load();
+
+  if (mode == Mode::Volume) {
     // One-button AtomS3R: click up, hold down. The StickS3 also has BtnB.
     if (M5.BtnA.wasSingleClicked()) {
       changeVolume((int)kVolumeStepPercent);
@@ -164,18 +195,22 @@ void IntercomApp::handleButtons() {
     return;
   }
 
-  if (_mode.load() == Mode::Live) {
+  if (mode == Mode::Live) {
     if (M5.BtnA.wasPressed()) {
       if (!_txActive.load() && !_recording.load() && !_sendingClip.load()) {
         startLiveTx();
       }
     }
     if (M5.BtnA.wasReleased()) {
-      if (_txActive.load()) {
+      // Do not let a local tap stop a remote spy stream.
+      if (_txActive.load() && !_spyServeLive.load()) {
         stopLiveTx();
       }
     }
-  } else {
+    return;
+  }
+
+  if (mode == Mode::Clip) {
     if (M5.BtnA.wasSingleClicked()) {
       if (_recording.load()) {
         stopClipRecordAndSend();
@@ -183,12 +218,71 @@ void IntercomApp::handleButtons() {
         startClipRecord();
       }
     }
+    return;
+  }
+
+  if (mode == Mode::Peer) {
+    if (M5.BtnA.wasSingleClicked()) {
+      peerToggleCurrent();
+    }
+    if (M5.BtnA.wasHold()) {
+      peerCycleNext();
+    }
+    return;
+  }
+
+  // Spy mode: hold to listen live, click to record a clip on the peer.
+  if (M5.BtnA.wasHold()) {
+    if (!_spyRequestLive.load() && !_spyRequestClip.load() &&
+        !_spyAwaitClip.load()) {
+      int index = spyTargetIndex();
+      Peer peer;
+      if (index < 0 || !peerAt(index, peer)) {
+        setError();
+        return;
+      }
+      memcpy(_spyTargetAddr, peer.addr, sizeof(_spyTargetAddr));
+      _spyTargetPort = peer.port;
+      _jitter.clear();
+      sendSpyCommand(kSpyLiveStart, peer.addr, peer.port);
+      _spyRequestLive.store(true);
+      _spyRequestUntilMs = millis() + kSpyLiveMaxMs;
+    }
+  }
+
+  if (M5.BtnA.wasReleased()) {
+    if (_spyRequestLive.load()) {
+      sendSpyCommand(kSpyLiveStop, _spyTargetAddr, _spyTargetPort);
+      _spyRequestLive.store(false);
+    }
+  }
+
+  if (M5.BtnA.wasSingleClicked()) {
+    if (_spyRequestClip.load()) {
+      sendSpyCommand(kSpyClipStop, _spyTargetAddr, _spyTargetPort);
+      _spyRequestClip.store(false);
+      _spyAwaitClip.store(true);
+      _spyRequestUntilMs = millis() + kSpyClipTimeoutMs;
+    } else if (!_spyRequestLive.load() && !_spyAwaitClip.load()) {
+      int index = spyTargetIndex();
+      Peer peer;
+      if (index < 0 || !peerAt(index, peer)) {
+        setError();
+        return;
+      }
+      memcpy(_spyTargetAddr, peer.addr, sizeof(_spyTargetAddr));
+      _spyTargetPort = peer.port;
+      _jitter.clear();
+      sendSpyCommand(kSpyClipStart, peer.addr, peer.port);
+      _spyRequestClip.store(true);
+      _spyRequestUntilMs = millis() + kSpyClipTimeoutMs;
+    }
   }
 }
 
-void IntercomApp::startLiveTx() {
+bool IntercomApp::startLiveTx(bool spy) {
   if (_txActive.load() || _recording.load() || _sendingClip.load()) {
-    return;
+    return false;
   }
 
   _encoder.reset();
@@ -197,11 +291,16 @@ void IntercomApp::startLiveTx() {
   if (!_audio.startCapture()) {
     setPlayback(true);
     setError();
-    return;
+    return false;
   }
 
+  _spyServeLive.store(spy);
+  if (spy) {
+    _spyServeStartMs = millis();
+  }
   _txActive.store(true);
-  Serial.println("[app] live tx start");
+  Serial.println(spy ? "[app] spy live start" : "[app] live tx start");
+  return true;
 }
 
 void IntercomApp::stopLiveTx() {
@@ -210,31 +309,36 @@ void IntercomApp::stopLiveTx() {
   }
 
   _txActive.store(false);
+  _spyServeLive.store(false);
+  _spyRequesterValid = false;
   _audio.stopCapture();
   _micLevel.store(0.0f);
   setPlayback(true);
   Serial.println("[app] live tx stop");
 }
 
-void IntercomApp::startClipRecord() {
+bool IntercomApp::startClipRecord(bool spy) {
   if (_recording.load() || _sendingClip.load() || _txActive.load()) {
-    return;
+    return false;
   }
 
   _clip.clear();
   _recordingStartMs = millis();
   _recordingMs.store(0);
   _encoder.reset();
+  _txSeq = 0;
 
   setPlayback(false);
   if (!_audio.startCapture()) {
     setPlayback(true);
     setError();
-    return;
+    return false;
   }
 
+  _spyRecording.store(spy);
   _recording.store(true);
-  Serial.println("[app] clip record start");
+  Serial.println(spy ? "[app] spy clip record start" : "[app] clip record start");
+  return true;
 }
 
 void IntercomApp::stopClipRecordAndSend() {
@@ -247,8 +351,28 @@ void IntercomApp::stopClipRecordAndSend() {
   setPlayback(false);
   _micLevel.store(0.0f);
 
+  _clipSpyReply = _spyRecording.load();
+  _spyRecording.store(false);
+  if (_clipSpyReply) {
+    _clipBroadcast = false;
+    _clipTargetCount = 1;
+    memcpy(_clipTargets[0].addr, _spyRequesterAddr,
+           sizeof(_clipTargets[0].addr));
+    _clipTargets[0].port = _spyRequesterPort;
+    _clipTargets[0].viaWifi = _spyRequesterPort != 0;
+  } else {
+    bool all = false;
+    _clipTargetCount = collectTargets(_clipTargets, kMaxPeers, all);
+    _clipBroadcast = all;
+  }
+
   size_t samples = _clip.available();
   if (samples == 0) {
+    if (_clipSpyReply) {
+      sendSpyCommand(kSpyClipDone, _spyRequesterAddr, _spyRequesterPort);
+      _clipSpyReply = false;
+      _spyRequesterValid = false;
+    }
     setPlayback(true);
     _state.store(State::Idle);
     return;
@@ -274,6 +398,11 @@ void IntercomApp::cancelClipRecord() {
   _clip.clear();
   _recordingMs.store(0);
   _micLevel.store(0.0f);
+  if (_spyRecording.load()) {
+    _spyRecording.store(false);
+    sendSpyCommand(kSpyClipDone, _spyRequesterAddr, _spyRequesterPort);
+    _spyRequesterValid = false;
+  }
   setPlayback(true);
   _state.store(State::Idle);
   Serial.println("[app] clip record cancelled");
@@ -286,6 +415,11 @@ void IntercomApp::sendClipStep() {
     _clipSendPos = 0;
     _sendProgress.store(0);
     _encoder.reset();
+    if (_clipSpyReply) {
+      sendSpyCommand(kSpyClipDone, _spyRequesterAddr, _spyRequesterPort);
+      _clipSpyReply = false;
+      _spyRequesterValid = false;
+    }
     setPlayback(true);
     Serial.println("[app] clip send done");
     return;
@@ -314,9 +448,13 @@ void IntercomApp::sendClipStep() {
   header->payloadLen = (uint8_t)bytes;
   memcpy(_txPacket + sizeof(PacketHeader), _adpcmFrame, bytes);
 
-  Transport* t = _transport.activeTransport();
-  if (t) {
-    t->send(_txPacket, sizeof(PacketHeader) + bytes);
+  const size_t len = sizeof(PacketHeader) + bytes;
+  if (_clipBroadcast) {
+    broadcastAll(_txPacket, len);
+  } else {
+    for (size_t i = 0; i < _clipTargetCount; ++i) {
+      sendToPeer(_clipTargets[i].addr, _clipTargets[i].port, _txPacket, len);
+    }
   }
 
   _clipSendPos += got;
@@ -324,7 +462,9 @@ void IntercomApp::sendClipStep() {
 }
 
 void IntercomApp::cycleMode() {
-  if (_recording.load() || _sendingClip.load() || _txActive.load()) {
+  if (_recording.load() || _sendingClip.load() || _txActive.load() ||
+      _spyRequestLive.load() || _spyRequestClip.load() ||
+      _spyAwaitClip.load()) {
     return;
   }
 
@@ -334,6 +474,12 @@ void IntercomApp::cycleMode() {
       next = Mode::Clip;
       break;
     case Mode::Clip:
+      next = Mode::Spy;
+      break;
+    case Mode::Spy:
+      next = Mode::Peer;
+      break;
+    case Mode::Peer:
       next = Mode::Volume;
       break;
     default:
@@ -398,6 +544,11 @@ void IntercomApp::updateState() {
     _state.store(State::Rx);
     return;
   }
+  if (_spyRequestLive.load() || _spyRequestClip.load() ||
+      _spyAwaitClip.load() || _spyServeLive.load()) {
+    _state.store(State::Spy);
+    return;
+  }
   _state.store(State::Idle);
 }
 
@@ -406,16 +557,9 @@ void IntercomApp::updateUi() {
   UiState s;
   s.state = _state.load();
   s.mode = _mode.load();
-  s.peerOnline = t ? t->hasPeer() : false;
-  if (t) {
-    t->peerName(s.peerName, sizeof(s.peerName));
-    s.peerRssi = t->peerRssi();
-    s.transportType = t->typeName();  // "ESP-NOW" or "WiFi"
-  } else {
-    s.peerName[0] = 0;
-    s.peerRssi = 0;
-    s.transportType = "none";
-  }
+  strncpy(s.selfName, _deviceName, sizeof(s.selfName) - 1);
+  s.transportType = t ? t->typeName() : "none";
+  fillPeerUi(s);
   s.battery = _battery.load();
   s.micLevel = _micLevel.load();
   s.rxLevel = _rxLevel.load();
@@ -424,6 +568,10 @@ void IntercomApp::updateUi() {
   s.volume = _volume;
   s.sampleRate = kSampleRate;
   s.channel = kChannel;
+  s.spyLive = _spyRequestLive.load() || _spyServeLive.load();
+  s.spyClip = _spyRequestClip.load() || _spyRecording.load();
+  s.spyAwait = _spyAwaitClip.load();
+  s.spy = s.spyLive || s.spyClip || s.spyAwait;
   _ui.render(s);
 }
 
@@ -432,7 +580,7 @@ void IntercomApp::sendHello() {
   uint8_t value = (battery < 0) ? 0xFF : (uint8_t)battery;
   Transport* t = _transport.activeTransport();
   if (t) {
-    t->sendHello(INTERCOM_DEVICE_NAME, value, _mode.load());
+    t->sendHello(_deviceName, value, _mode.load());
   }
 }
 
@@ -471,9 +619,11 @@ void IntercomApp::runTx() {
       header->payloadLen = (uint8_t)bytes;
       memcpy(_txPacket + sizeof(PacketHeader), _adpcmFrame, bytes);
 
-      Transport* t = _transport.activeTransport();
-      if (t) {
-        t->send(_txPacket, sizeof(PacketHeader) + bytes);
+      const size_t len = sizeof(PacketHeader) + bytes;
+      if (_spyServeLive.load()) {
+        sendToPeer(_spyRequesterAddr, _spyRequesterPort, _txPacket, len);
+      } else {
+        sendToTargets(_txPacket, len);
       }
       continue;
     }
@@ -521,12 +671,32 @@ void IntercomApp::runRx() {
 
     const PacketHeader* header = (const PacketHeader*)packet.data;
     if (header->magic != kMagic || header->version != kVersion ||
-        header->type != kPacketAudio) {
-      continue;
-    }
-    if (header->payloadLen == 0 ||
         header->payloadLen > packet.len - sizeof(PacketHeader)) {
       continue;
+    }
+
+    if (header->type == kPacketHello) {
+      updatePeer(packet);
+      continue;
+    }
+    if (header->type == kPacketSpy) {
+      handleSpyPacket(packet);
+      continue;
+    }
+    if (header->type != kPacketAudio || header->payloadLen == 0) {
+      continue;
+    }
+    if (!acceptAudio(packet.src, packet.port)) {
+      continue;
+    }
+
+    if (!_haveLastAudioSrc ||
+        memcmp(_lastAudioSrc, packet.src, sizeof(_lastAudioSrc)) != 0 ||
+        _lastAudioPort != packet.port) {
+      memcpy(_lastAudioSrc, packet.src, sizeof(_lastAudioSrc));
+      _lastAudioPort = packet.port;
+      _haveLastAudioSrc = true;
+      _haveLastSeq = false;
     }
 
     if (_haveLastSeq) {
@@ -596,6 +766,518 @@ void IntercomApp::runPlay() {
       vTaskDelay(pdMS_TO_TICKS(wait));
     }
   }
+}
+
+void IntercomApp::updatePeer(const RxPacket& packet) {
+  const PacketHeader* header = (const PacketHeader*)packet.data;
+  if (header->payloadLen < sizeof(HelloPayload)) {
+    return;
+  }
+  const HelloPayload* hello =
+      (const HelloPayload*)(packet.data + sizeof(PacketHeader));
+
+  if (strncmp(hello->name, _deviceName, sizeof(_deviceName)) == 0) {
+    return;
+  }
+  if (packet.port == 0) {
+    if (memcmp(packet.src, _selfMac, sizeof(_selfMac)) == 0) {
+      return;
+    }
+  } else {
+    IPAddress local = WiFi.localIP();
+    if (packet.src[0] == local[0] && packet.src[1] == local[1] &&
+        packet.src[2] == local[2] && packet.src[3] == local[3]) {
+      return;
+    }
+  }
+
+  if (!_peerMutex || xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+    return;
+  }
+
+  int slot = -1;
+  bool existing = false;
+  for (size_t i = 0; i < kMaxPeers; ++i) {
+    if (_peers[i].used && _peers[i].port == packet.port &&
+        memcmp(_peers[i].addr, packet.src, sizeof(_peers[i].addr)) == 0) {
+      slot = (int)i;
+      existing = true;
+      break;
+    }
+  }
+  if (slot < 0) {
+    for (size_t i = 0; i < kMaxPeers; ++i) {
+      if (!_peers[i].used) {
+        slot = (int)i;
+        break;
+      }
+    }
+  }
+  if (slot < 0) {
+    uint32_t oldest = UINT32_MAX;
+    for (size_t i = 0; i < kMaxPeers; ++i) {
+      if (_peers[i].lastSeenMs < oldest) {
+        oldest = _peers[i].lastSeenMs;
+        slot = (int)i;
+      }
+    }
+  }
+  if (slot < 0) {
+    xSemaphoreGive(_peerMutex);
+    return;
+  }
+
+  Peer& peer = _peers[slot];
+  if (!existing) {
+    peer = Peer();
+    peer.used = true;
+  }
+  memcpy(peer.addr, packet.src, sizeof(peer.addr));
+  peer.port = packet.port;
+  peer.viaWifi = packet.port != 0;
+  peer.battery = hello->battery;
+  peer.mode = hello->mode;
+  peer.rssi = packet.rssi;
+  peer.lastSeenMs = millis();
+  peer.online = true;
+  peer.receiveOnly = (header->flags & kHelloFlagReceiveOnly) != 0;
+  strncpy(peer.name, hello->name, sizeof(peer.name) - 1);
+  peer.name[sizeof(peer.name) - 1] = 0;
+
+  xSemaphoreGive(_peerMutex);
+}
+
+void IntercomApp::expirePeers() {
+  if (!_peerMutex || xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  bool removed = false;
+  for (size_t i = 0; i < kMaxPeers; ++i) {
+    if (_peers[i].used && (uint32_t)(now - _peers[i].lastSeenMs) > kPeerTimeoutMs) {
+      _peers[i].used = false;
+      removed = true;
+    }
+  }
+
+  if (removed) {
+    size_t write = 0;
+    for (size_t i = 0; i < kMaxPeers; ++i) {
+      if (_peers[i].used) {
+        if (write != i) {
+          _peers[write] = _peers[i];
+        }
+        ++write;
+      }
+    }
+    for (size_t i = write; i < kMaxPeers; ++i) {
+      _peers[i] = Peer();
+    }
+    _peerIndex = -1;
+    if (write == 0) {
+      _targetAll = true;
+    }
+  }
+
+  xSemaphoreGive(_peerMutex);
+}
+
+bool IntercomApp::peerAt(int index, Peer& out) const {
+  if (index < 0 || !_peerMutex ||
+      xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+    return false;
+  }
+  int count = 0;
+  bool found = false;
+  for (size_t i = 0; i < kMaxPeers; ++i) {
+    if (!_peers[i].used) {
+      continue;
+    }
+    if (count == index) {
+      out = _peers[i];
+      found = true;
+      break;
+    }
+    ++count;
+  }
+  xSemaphoreGive(_peerMutex);
+  return found;
+}
+
+void IntercomApp::peerCycleNext() {
+  if (!_peerMutex || xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+    return;
+  }
+  int count = 0;
+  for (size_t i = 0; i < kMaxPeers; ++i) {
+    if (_peers[i].used) {
+      ++count;
+    }
+  }
+  if (count == 0) {
+    _peerIndex = -1;
+  } else {
+    int next = _peerIndex + 1;
+    _peerIndex = (next >= count) ? -1 : (int8_t)next;
+  }
+  xSemaphoreGive(_peerMutex);
+}
+
+void IntercomApp::peerToggleCurrent() {
+  if (!_peerMutex || xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+    return;
+  }
+  int count = 0;
+  for (size_t i = 0; i < kMaxPeers; ++i) {
+    if (_peers[i].used) {
+      ++count;
+    }
+  }
+  if (count == 0) {
+    _peerIndex = -1;
+    _targetAll = true;
+    xSemaphoreGive(_peerMutex);
+    return;
+  }
+  if (_peerIndex < 0) {
+    _targetAll = true;
+    for (size_t i = 0; i < kMaxPeers; ++i) {
+      _peers[i].selected = false;
+    }
+  } else {
+    int index = 0;
+    for (size_t i = 0; i < kMaxPeers; ++i) {
+      if (!_peers[i].used) {
+        continue;
+      }
+      if (index == _peerIndex) {
+        if (_targetAll) {
+          _targetAll = false;
+          for (size_t j = 0; j < kMaxPeers; ++j) {
+            _peers[j].selected = false;
+          }
+          _peers[i].selected = true;
+        } else {
+          _peers[i].selected = !_peers[i].selected;
+          bool any = false;
+          for (size_t j = 0; j < kMaxPeers; ++j) {
+            if (_peers[j].used && _peers[j].selected) {
+              any = true;
+              break;
+            }
+          }
+          if (!any) {
+            _targetAll = true;
+          }
+        }
+        break;
+      }
+      ++index;
+    }
+  }
+  xSemaphoreGive(_peerMutex);
+}
+
+size_t IntercomApp::collectTargets(Target* out, size_t max, bool& all) const {
+  all = true;
+  if (!_peerMutex || xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+    return 0;
+  }
+  if (_targetAll) {
+    xSemaphoreGive(_peerMutex);
+    return 0;
+  }
+  all = false;
+  size_t count = 0;
+  for (size_t i = 0; i < kMaxPeers && count < max; ++i) {
+    if (!_peers[i].used || !_peers[i].selected || !_peers[i].online) {
+      continue;
+    }
+    memcpy(out[count].addr, _peers[i].addr, sizeof(out[count].addr));
+    out[count].port = _peers[i].port;
+    out[count].viaWifi = _peers[i].viaWifi;
+    ++count;
+  }
+  if (count == 0) {
+    all = true;
+  }
+  xSemaphoreGive(_peerMutex);
+  return count;
+}
+
+bool IntercomApp::sendToPeer(const uint8_t* addr, uint16_t port,
+                             const uint8_t* data, size_t len) {
+  if (!addr || !data || len == 0) {
+    return false;
+  }
+  Transport* t = (port != 0) ? (Transport*)_transport.wifi()
+                             : (Transport*)_transport.espNow();
+  return t ? t->sendTo(addr, port, data, len) : false;
+}
+
+bool IntercomApp::broadcastAll(const uint8_t* data, size_t len) {
+  // Send on every available transport so ESP-NOW-only receivers such as the
+  // ATOM Lite speaker still hear ALL traffic when the manager prefers WiFi.
+  bool ok = _transport.espNow()->broadcast(data, len);
+  ok = _transport.wifi()->broadcast(data, len) || ok;
+  return ok;
+}
+
+bool IntercomApp::sendToTargets(const uint8_t* data, size_t len) {
+  Target targets[kMaxPeers];
+  bool all = false;
+  size_t count = collectTargets(targets, kMaxPeers, all);
+  if (all) {
+    return broadcastAll(data, len);
+  }
+  bool ok = false;
+  for (size_t i = 0; i < count; ++i) {
+    ok = sendToPeer(targets[i].addr, targets[i].port, data, len) || ok;
+  }
+  return ok;
+}
+
+void IntercomApp::fillPeerUi(UiState& s) const {
+  s.peerOnline = false;
+  s.peerName[0] = 0;
+  s.peerRssi = 0;
+  s.peerCount = 0;
+  s.peerIndex = -1;
+  s.targetAll = true;
+  s.peerSelected = false;
+  s.selectedCount = 0;
+
+  if (!_peerMutex || xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+    return;
+  }
+
+  int count = 0;
+  int selected = 0;
+  int first = -1;
+  for (size_t i = 0; i < kMaxPeers; ++i) {
+    if (!_peers[i].used) {
+      continue;
+    }
+    ++count;
+    if (_targetAll || _peers[i].selected) {
+      ++selected;
+      if (first < 0) {
+        first = (int)i;
+      }
+      if (_peers[i].online) {
+        s.peerOnline = true;
+      }
+    }
+  }
+
+  s.peerCount = (uint8_t)count;
+  s.peerIndex = _peerIndex;
+  s.targetAll = _targetAll;
+  s.selectedCount = (uint8_t)selected;
+
+  if (_mode.load() == Mode::Peer) {
+    if (_peerIndex < 0) {
+      strncpy(s.peerName, "ALL", sizeof(s.peerName) - 1);
+      s.peerSelected = _targetAll;
+      if (count > 0) {
+        for (size_t i = 0; i < kMaxPeers; ++i) {
+          if (_peers[i].used) {
+            s.peerOnline = _peers[i].online;
+            s.peerRssi = _peers[i].rssi;
+            break;
+          }
+        }
+      }
+    } else {
+      int index = 0;
+      for (size_t i = 0; i < kMaxPeers; ++i) {
+        if (!_peers[i].used) {
+          continue;
+        }
+        if (index == _peerIndex) {
+          strncpy(s.peerName, _peers[i].name, sizeof(s.peerName) - 1);
+          s.peerOnline = _peers[i].online;
+          s.peerRssi = _peers[i].rssi;
+          s.peerSelected = _targetAll || _peers[i].selected;
+          break;
+        }
+        ++index;
+      }
+    }
+  } else if (count == 0) {
+    strncpy(s.peerName, "NO PEER", sizeof(s.peerName) - 1);
+  } else if (_targetAll || selected == 0) {
+    // No individual selection left: sends fall back to broadcast.
+    strncpy(s.peerName, "ALL", sizeof(s.peerName) - 1);
+  } else if (selected == 1 && first >= 0) {
+    strncpy(s.peerName, _peers[first].name, sizeof(s.peerName) - 1);
+    s.peerRssi = _peers[first].rssi;
+  } else {
+    snprintf(s.peerName, sizeof(s.peerName), "%d PEERS", selected);
+  }
+
+  s.peerName[sizeof(s.peerName) - 1] = 0;
+  xSemaphoreGive(_peerMutex);
+}
+
+void IntercomApp::handleSpyPacket(const RxPacket& packet) {
+  const PacketHeader* header = (const PacketHeader*)packet.data;
+  if (header->payloadLen < sizeof(SpyPayload)) {
+    return;
+  }
+  const uint8_t command =
+      ((const SpyPayload*)(packet.data + sizeof(PacketHeader)))->command;
+
+  const bool fromTarget =
+      packet.port == _spyTargetPort &&
+      memcmp(packet.src, _spyTargetAddr, sizeof(_spyTargetAddr)) == 0;
+
+  if (command == kSpyClipDone || command == kSpyBusy) {
+    if (!fromTarget) {
+      return;
+    }
+    _spyRequestLive.store(false);
+    _spyRequestClip.store(false);
+    _spyAwaitClip.store(false);
+    if (command == kSpyBusy) {
+      setError();
+    }
+    return;
+  }
+
+  memcpy(_pendingSpyAddr, packet.src, sizeof(_pendingSpyAddr));
+  _pendingSpyPort = packet.port;
+  _pendingSpyCmd.store(command);
+}
+
+void IntercomApp::handlePendingSpy() {
+  const uint8_t command = _pendingSpyCmd.exchange(0);
+  if (command == 0) {
+    return;
+  }
+
+  switch (command) {
+    case kSpyLiveStart:
+      if (_txActive.load() || _recording.load() || _sendingClip.load()) {
+        // Busy: keep the current requester untouched.
+        sendSpyCommand(kSpyBusy, _pendingSpyAddr, _pendingSpyPort);
+        break;
+      }
+      memcpy(_spyRequesterAddr, _pendingSpyAddr, sizeof(_spyRequesterAddr));
+      _spyRequesterPort = _pendingSpyPort;
+      _spyRequesterValid = true;
+      if (!startLiveTx(true)) {
+        sendSpyCommand(kSpyBusy, _spyRequesterAddr, _spyRequesterPort);
+        _spyRequesterValid = false;
+      }
+      break;
+    case kSpyLiveStop:
+      if (_spyServeLive.load()) {
+        stopLiveTx();
+      }
+      break;
+    case kSpyClipStart:
+      if (_txActive.load() || _recording.load() || _sendingClip.load()) {
+        // Busy: keep the current requester untouched.
+        sendSpyCommand(kSpyBusy, _pendingSpyAddr, _pendingSpyPort);
+        break;
+      }
+      memcpy(_spyRequesterAddr, _pendingSpyAddr, sizeof(_spyRequesterAddr));
+      _spyRequesterPort = _pendingSpyPort;
+      _spyRequesterValid = true;
+      if (!startClipRecord(true)) {
+        sendSpyCommand(kSpyBusy, _spyRequesterAddr, _spyRequesterPort);
+        _spyRequesterValid = false;
+      }
+      break;
+    case kSpyClipStop:
+      if (_spyRecording.load()) {
+        stopClipRecordAndSend();
+      } else if (!_sendingClip.load() && _spyRequesterValid) {
+        sendSpyCommand(kSpyClipDone, _spyRequesterAddr, _spyRequesterPort);
+        _spyRequesterValid = false;
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+void IntercomApp::sendSpyCommand(uint8_t cmd, const uint8_t* addr,
+                                 uint16_t port) {
+  if (!addr) {
+    return;
+  }
+  alignas(4) uint8_t buf[sizeof(PacketHeader) + sizeof(SpyPayload)] = {};
+  PacketHeader* header = (PacketHeader*)buf;
+  SpyPayload* payload = (SpyPayload*)(buf + sizeof(PacketHeader));
+
+  header->magic = kMagic;
+  header->version = kVersion;
+  header->type = kPacketSpy;
+  header->flags = 0;
+  header->seq = 0;
+  header->predictor = 0;
+  header->adpcmIndex = 0;
+  header->payloadLen = sizeof(SpyPayload);
+  payload->command = cmd;
+
+  sendToPeer(addr, port, buf, sizeof(buf));
+}
+
+int IntercomApp::spyTargetIndex() const {
+  if (!_peerMutex || xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+    return -1;
+  }
+  int online = 0;
+  int lastOnline = -1;
+  int selected = 0;
+  int selectedIndex = -1;
+  for (size_t i = 0; i < kMaxPeers; ++i) {
+    // Receive-only units have no microphone, so they are never spy targets.
+    if (!_peers[i].used || !_peers[i].online || _peers[i].receiveOnly) {
+      continue;
+    }
+    ++online;
+    lastOnline = (int)i;
+    if (_peers[i].selected) {
+      ++selected;
+      selectedIndex = (int)i;
+    }
+  }
+  const bool all = _targetAll;
+  xSemaphoreGive(_peerMutex);
+
+  if (all) {
+    return online == 1 ? lastOnline : -1;
+  }
+  return selected == 1 ? selectedIndex : -1;
+}
+
+bool IntercomApp::acceptAudio(const uint8_t* src, uint16_t port) const {
+  if (_spyRequestLive.load() || _spyRequestClip.load() ||
+      _spyAwaitClip.load()) {
+    return port == _spyTargetPort &&
+           memcmp(src, _spyTargetAddr, sizeof(_spyTargetAddr)) == 0;
+  }
+
+  if (!_peerMutex || xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+    return true;
+  }
+  bool allowed = _targetAll;
+  if (!allowed) {
+    for (size_t i = 0; i < kMaxPeers; ++i) {
+      if (_peers[i].used && _peers[i].selected && _peers[i].online &&
+          _peers[i].port == port &&
+          memcmp(_peers[i].addr, src, sizeof(_peers[i].addr)) == 0) {
+        allowed = true;
+        break;
+      }
+    }
+  }
+  xSemaphoreGive(_peerMutex);
+  return allowed;
 }
 
 void IntercomApp::txTask(void* arg) {

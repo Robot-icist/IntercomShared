@@ -112,6 +112,40 @@ namespace intercom
     return err == ESP_OK;
   }
 
+  bool EspNowTransport::sendTo(const uint8_t *addr, uint16_t port,
+                               const uint8_t *data, size_t len)
+  {
+    (void)port;
+    if (!addr || !data || len == 0 || len > kMaxPacketSize)
+    {
+      return false;
+    }
+    if (!esp_now_is_peer_exist(addr))
+    {
+      esp_now_peer_info_t peer = {};
+      memcpy(peer.peer_addr, addr, 6);
+      peer.channel = kChannel;
+      peer.ifidx = WIFI_IF_STA;
+      peer.encrypt = false;
+      esp_err_t err = esp_now_add_peer(&peer);
+      if (err != ESP_OK && err != ESP_ERR_ESPNOW_EXIST)
+      {
+        Serial.printf("[espnow] add peer failed: %d\n", (int)err);
+        return false;
+      }
+    }
+    return esp_now_send(addr, data, len) == ESP_OK;
+  }
+
+  bool EspNowTransport::broadcast(const uint8_t *data, size_t len)
+  {
+    if (!data || len == 0 || len > kMaxPacketSize)
+    {
+      return false;
+    }
+    return esp_now_send(kBroadcast, data, len) == ESP_OK;
+  }
+
   bool EspNowTransport::sendHello(const char *name, uint8_t battery, Mode mode)
   {
     alignas(4) uint8_t buf[sizeof(PacketHeader) + sizeof(HelloPayload)];
@@ -135,7 +169,7 @@ namespace intercom
       strncpy(payload->name, name, sizeof(payload->name) - 1);
     }
 
-    return send(buf, sizeof(buf));
+    return broadcast(buf, sizeof(buf));
   }
 
   bool EspNowTransport::poll()
@@ -278,10 +312,11 @@ namespace intercom
       updatePeerName(payload->name);
       _peerRssi.store(rssi);
       _lastPeerMs.store(millis());
+      queuePacket(src, rssi, data, len);
       return;
     }
 
-    if (header->type == kPacketAudio)
+    if (header->type == kPacketAudio || header->type == kPacketSpy)
     {
       if (header->payloadLen == 0)
       {
@@ -290,16 +325,26 @@ namespace intercom
       notePeer(src);
       _peerRssi.store(rssi);
       _lastPeerMs.store(millis());
+      queuePacket(src, rssi, data, len);
+    }
+  }
 
-      RxPacket packet;
-      memcpy(packet.src, src, sizeof(packet.src));
-      packet.rssi = rssi;
-      packet.len = (uint16_t)len;
-      memcpy(packet.data, data, len);
-      if (xQueueSend(_queue, &packet, 0) != pdTRUE)
-      {
-        _dropped.fetch_add(1);
-      }
+  void EspNowTransport::queuePacket(const uint8_t *src, int8_t rssi,
+                                    const uint8_t *data, int len)
+  {
+    if (!_queue || !src || !data || len <= 0 || len > (int)kMaxPacketSize)
+    {
+      return;
+    }
+    RxPacket packet;
+    memcpy(packet.src, src, sizeof(packet.src));
+    packet.rssi = rssi;
+    packet.port = 0;
+    packet.len = (uint16_t)len;
+    memcpy(packet.data, data, len);
+    if (xQueueSend(_queue, &packet, 0) != pdTRUE)
+    {
+      _dropped.fetch_add(1);
     }
   }
 
@@ -459,6 +504,37 @@ namespace intercom
     return written == len;
   }
 
+  bool WiFiTransport::sendTo(const uint8_t *addr, uint16_t port,
+                             const uint8_t *data, size_t len)
+  {
+    if (!addr || !data || len == 0 || len > kMaxPacketSize || !_wifiConnected)
+    {
+      return false;
+    }
+    IPAddress ip(addr[0], addr[1], addr[2], addr[3]);
+    if (port == 0)
+    {
+      port = kIntercomPort;
+    }
+    _udp.beginPacket(ip, port);
+    size_t written = _udp.write(data, len);
+    _udp.endPacket();
+    return written == len;
+  }
+
+  bool WiFiTransport::broadcast(const uint8_t *data, size_t len)
+  {
+    if (!data || len == 0 || len > kMaxPacketSize || !_wifiConnected)
+    {
+      return false;
+    }
+    IPAddress broadcastIP = WiFi.broadcastIP();
+    _udp.beginPacket(broadcastIP, kIntercomPort);
+    size_t written = _udp.write(data, len);
+    _udp.endPacket();
+    return written == len;
+  }
+
   bool WiFiTransport::sendHello(const char *name, uint8_t battery, Mode mode)
   {
     alignas(4) uint8_t buf[sizeof(PacketHeader) + sizeof(HelloPayload)];
@@ -482,14 +558,7 @@ namespace intercom
       strncpy(payload->name, name, sizeof(payload->name) - 1);
     }
 
-    // Broadcast hello on local network
-    if (!_wifiConnected)
-      return false;
-    IPAddress broadcast = WiFi.broadcastIP();
-    _udp.beginPacket(broadcast, kIntercomPort);
-    _udp.write(buf, sizeof(buf));
-    _udp.endPacket();
-    return true;
+    return broadcast(buf, sizeof(buf));
   }
 
   bool WiFiTransport::poll()
@@ -631,37 +700,29 @@ namespace intercom
             {
               if (header->flags & 0x80)
               {
-                // Discovery packet
+                // Discovery packet: transport-level only, the app gets the
+                // regular hello once the link is selected.
                 handleDiscoveryResponse(remoteIP, remotePort, buffer, len);
               }
               else if (header->payloadLen >= sizeof(HelloPayload))
               {
-                const HelloPayload *payload =
-                    (const HelloPayload *)(buffer + sizeof(PacketHeader));
-                notePeer(remoteIP, remotePort, rssi);
-                updatePeerName(payload->name);
+                if (remoteIP != WiFi.localIP())
+                {
+                  const HelloPayload *payload =
+                      (const HelloPayload *)(buffer + sizeof(PacketHeader));
+                  notePeer(remoteIP, remotePort, rssi);
+                  updatePeerName(payload->name);
+                  queuePacket(remoteIP, remotePort, rssi, buffer, len);
+                }
               }
             }
-            else if (header->type == kPacketAudio)
+            else if (header->type == kPacketAudio ||
+                     header->type == kPacketSpy)
             {
               notePeer(remoteIP, remotePort, rssi);
               _peerRssi.store(rssi);
               _lastPeerMs = millis();
-
-              RxPacket packet;
-              packet.src[0] = remoteIP[0];
-              packet.src[1] = remoteIP[1];
-              packet.src[2] = remoteIP[2];
-              packet.src[3] = remoteIP[3];
-              packet.src[4] = 0;
-              packet.src[5] = 0;
-              packet.rssi = rssi;
-              packet.len = (uint16_t)len;
-              memcpy(packet.data, buffer, len);
-              if (xQueueSend(_queue, &packet, 0) != pdTRUE)
-              {
-                _dropped.fetch_add(1);
-              }
+              queuePacket(remoteIP, remotePort, rssi, buffer, len);
             }
           }
         }
@@ -670,6 +731,30 @@ namespace intercom
     }
 
     _udp.stop();
+  }
+
+  void WiFiTransport::queuePacket(const IPAddress &srcIP, uint16_t port,
+                                  int8_t rssi, const uint8_t *data, int len)
+  {
+    if (!_queue || !data || len <= 0 || len > (int)kMaxPacketSize)
+    {
+      return;
+    }
+    RxPacket packet;
+    packet.src[0] = srcIP[0];
+    packet.src[1] = srcIP[1];
+    packet.src[2] = srcIP[2];
+    packet.src[3] = srcIP[3];
+    packet.src[4] = 0;
+    packet.src[5] = 0;
+    packet.rssi = rssi;
+    packet.port = port;
+    packet.len = (uint16_t)len;
+    memcpy(packet.data, data, len);
+    if (xQueueSend(_queue, &packet, 0) != pdTRUE)
+    {
+      _dropped.fetch_add(1);
+    }
   }
 
   void WiFiTransport::handleDiscoveryResponse(const IPAddress &srcIP, uint16_t srcPort,

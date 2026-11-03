@@ -11,7 +11,9 @@ namespace intercom {
 enum class Mode : uint8_t {
   Live = 0,    // push-to-talk while the button is held
   Clip = 1,    // click to record, click again to send the clip
-  Volume = 2,  // local speaker volume
+  Spy = 2,     // remote mic listen / remote clip record
+  Peer = 3,    // choose the destination peer(s)
+  Volume = 4,  // local speaker volume
 };
 
 enum class State : uint8_t {
@@ -20,12 +22,28 @@ enum class State : uint8_t {
   Rec,
   Send,
   Rx,
+  Spy,
   Error,
 };
 
 enum PacketType : uint8_t {
   kPacketHello = 1,
   kPacketAudio = 2,
+  kPacketSpy = 3,
+};
+
+// Hello header flags. The WiFi transport reserves 0x80 for discovery.
+// Receive-only units (for example the ATOM Lite speaker) set bit 0 so spy
+// mode never tries to record from them.
+constexpr uint8_t kHelloFlagReceiveOnly = 0x01;
+
+enum SpyCommand : uint8_t {
+  kSpyLiveStart = 1,
+  kSpyLiveStop = 2,
+  kSpyClipStart = 3,
+  kSpyClipStop = 4,
+  kSpyClipDone = 5,
+  kSpyBusy = 6,
 };
 
 #pragma pack(push, 1)
@@ -49,12 +67,20 @@ struct HelloPayload {
 };
 #pragma pack(pop)
 
+#pragma pack(push, 1)
+struct SpyPayload {
+  uint8_t command;
+};
+#pragma pack(pop)
+
 static_assert(sizeof(PacketHeader) == 10, "PacketHeader must stay 10 bytes");
 static_assert(sizeof(HelloPayload) == 18, "HelloPayload must stay 18 bytes");
+static_assert(sizeof(SpyPayload) == 1, "SpyPayload must stay 1 byte");
 
 struct RxPacket {
   uint8_t src[6];
   int8_t rssi;
+  uint16_t port;  // 0 for ESP-NOW, UDP port for WiFi
   uint16_t len;
   alignas(4) uint8_t data[250];
 };
@@ -74,12 +100,26 @@ struct UiState {
   uint32_t sampleRate = 16000;
   uint8_t channel = 1;
   const char* transportType = "ESP-NOW";  // Current transport: "ESP-NOW", "WiFi", "none"
+  char selfName[16] = {0};
+  uint8_t peerCount = 0;
+  int8_t peerIndex = -1;  // -1 = ALL
+  bool targetAll = true;
+  bool peerSelected = false;
+  uint8_t selectedCount = 0;
+  bool spy = false;       // spy activity on either side
+  bool spyLive = false;   // live spy stream active
+  bool spyClip = false;   // remote clip recording in progress
+  bool spyAwait = false;  // waiting for the remote clip to come back
 };
 
 inline const char* modeName(Mode mode) {
   switch (mode) {
     case Mode::Clip:
       return "CLIP";
+    case Mode::Spy:
+      return "SPY";
+    case Mode::Peer:
+      return "PEER";
     case Mode::Volume:
       return "VOL";
     default:
@@ -97,6 +137,8 @@ inline const char* stateName(State state) {
       return "SEND";
     case State::Rx:
       return "RX";
+    case State::Spy:
+      return "SPY";
     case State::Error:
       return "ERROR";
     default:

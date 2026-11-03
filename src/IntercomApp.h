@@ -20,6 +20,27 @@ class IntercomApp {
   void loop();
 
  private:
+  struct Peer {
+    bool used = false;
+    bool online = false;
+    bool selected = false;
+    bool viaWifi = false;
+    bool receiveOnly = false;
+    uint8_t addr[6] = {0};
+    uint16_t port = 0;
+    char name[16] = {0};
+    uint8_t battery = 0xFF;
+    uint8_t mode = 0;
+    int8_t rssi = 0;
+    uint32_t lastSeenMs = 0;
+  };
+
+  struct Target {
+    uint8_t addr[6] = {0};
+    uint16_t port = 0;
+    bool viaWifi = false;
+  };
+
   static void txTask(void* arg);
   static void rxTask(void* arg);
   static void playTask(void* arg);
@@ -29,9 +50,9 @@ class IntercomApp {
   void runPlay();
 
   void handleButtons();
-  void startLiveTx();
+  bool startLiveTx(bool spy = false);
   void stopLiveTx();
-  void startClipRecord();
+  bool startClipRecord(bool spy = false);
   void stopClipRecordAndSend();
   void cancelClipRecord();
   void sendClipStep();
@@ -44,6 +65,26 @@ class IntercomApp {
   void updateUi();
   void sendHello();
   int readBattery() const;
+
+  // Peer table and selection.
+  void updatePeer(const RxPacket& packet);
+  void expirePeers();
+  bool peerAt(int index, Peer& out) const;
+  void peerCycleNext();
+  void peerToggleCurrent();
+  size_t collectTargets(Target* out, size_t max, bool& all) const;
+  bool sendToTargets(const uint8_t* data, size_t len);
+  bool broadcastAll(const uint8_t* data, size_t len);
+  bool sendToPeer(const uint8_t* addr, uint16_t port, const uint8_t* data,
+                  size_t len);
+  void fillPeerUi(UiState& s) const;
+
+  // Spy mode.
+  void handleSpyPacket(const RxPacket& packet);
+  void handlePendingSpy();
+  void sendSpyCommand(uint8_t cmd, const uint8_t* addr, uint16_t port);
+  int spyTargetIndex() const;
+  bool acceptAudio(const uint8_t* src, uint16_t port) const;
 
   AudioEngine _audio;
   TransportManager _transport;
@@ -70,15 +111,52 @@ class IntercomApp {
   std::atomic<uint32_t> _recordingMs{0};
   std::atomic<uint32_t> _sendProgress{0};
 
+  char _deviceName[16] = {0};
+  uint8_t _selfMac[6] = {0};
+
+  Peer _peers[kMaxPeers];
+  SemaphoreHandle_t _peerMutex = nullptr;
+  int8_t _peerIndex = -1;  // -1 = ALL
+  bool _targetAll = true;
+
+  // Controller side of spy mode.
+  std::atomic<bool> _spyRequestLive{false};
+  std::atomic<bool> _spyRequestClip{false};
+  std::atomic<bool> _spyAwaitClip{false};
+  uint8_t _spyTargetAddr[6] = {0};
+  uint16_t _spyTargetPort = 0;
+  uint32_t _spyRequestUntilMs = 0;
+
+  // Target side of spy mode.
+  std::atomic<bool> _spyServeLive{false};
+  std::atomic<bool> _spyRecording{false};
+  uint8_t _spyRequesterAddr[6] = {0};
+  uint16_t _spyRequesterPort = 0;
+  bool _spyRequesterValid = false;
+  uint32_t _spyServeStartMs = 0;
+  std::atomic<uint8_t> _pendingSpyCmd{0};
+  uint8_t _pendingSpyAddr[6] = {0};
+  uint16_t _pendingSpyPort = 0;
+
+  // Clip send destination snapshot.
+  Target _clipTargets[kMaxPeers];
+  size_t _clipTargetCount = 0;
+  bool _clipBroadcast = false;
+  bool _clipSpyReply = false;
+
   uint16_t _txSeq = 0;
   uint16_t _lastSeq = 0;
   bool _haveLastSeq = false;
+  uint8_t _lastAudioSrc[6] = {0};
+  uint16_t _lastAudioPort = 0;
+  bool _haveLastAudioSrc = false;
 
   uint32_t _lastHelloMs = 0;
   uint32_t _lastBatteryMs = 0;
   uint32_t _lastUiMs = 0;
   uint32_t _recordingStartMs = 0;
   uint32_t _errorUntilMs = 0;
+  uint32_t _lastPeerExpireMs = 0;
 
   size_t _clipSendPos = 0;
   size_t _clipSendTotal = 0;

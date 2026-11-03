@@ -23,6 +23,8 @@ namespace intercom
         return TFT_CYAN;
       case State::Rx:
         return TFT_SKYBLUE;
+      case State::Spy:
+        return TFT_MAGENTA;
       case State::Error:
         return TFT_RED;
       default:
@@ -92,7 +94,7 @@ namespace intercom
     g.setTextSize(1);
     g.setTextDatum(lgfx::textdatum_t::top_left);
     g.setTextColor(TFT_LIGHTGREY);
-    g.drawString(INTERCOM_DEVICE_NAME, 4, 2);
+    g.drawString(s.selfName[0] ? s.selfName : INTERCOM_DEVICE_NAME, 4, 2);
 
     char battery[12];
     if (s.battery < 0)
@@ -114,10 +116,33 @@ namespace intercom
   {
     g.setTextDatum(lgfx::textdatum_t::top_left);
     g.setTextSize(2);
-    if (s.mode == Mode::Volume)
+    if (s.spy)
+    {
+      g.setTextColor(TFT_MAGENTA);
+      const char *label = "SPY";
+      if (s.spyClip)
+      {
+        label = "SPY REC";
+      }
+      else if (s.state == State::Rx)
+      {
+        label = "SPY RX";
+      }
+      else if (s.spyAwait)
+      {
+        label = "SPY WAIT";
+      }
+      g.drawString(label, 4, 18);
+    }
+    else if (s.mode == Mode::Volume)
     {
       g.setTextColor(TFT_YELLOW);
       g.drawString("VOLUME", 4, 18);
+    }
+    else if (s.mode == Mode::Peer)
+    {
+      g.setTextColor(TFT_YELLOW);
+      g.drawString("PEERS", 4, 18);
     }
     else
     {
@@ -134,10 +159,13 @@ namespace intercom
   void IntercomUi::drawPeer(lgfx::LGFXBase &g, const UiState &s)
   {
     const int y = 40;
-    g.fillCircle(7, y + 4, 3, s.peerOnline ? TFT_GREEN : TFT_DARKGREY);
+    const bool selected = s.mode == Mode::Peer ? s.peerSelected : s.peerOnline;
+    g.fillCircle(7, y + 4, 3,
+                 selected ? TFT_YELLOW : (s.peerOnline ? TFT_GREEN : TFT_DARKGREY));
 
-    char name[9] = {0};
-    if (s.peerOnline && s.peerName[0])
+    // Keep the full MAC suffix visible so identical boards stay distinguishable.
+    char name[11] = {0};
+    if (s.peerName[0])
     {
       strncpy(name, s.peerName, sizeof(name) - 1);
     }
@@ -151,11 +179,16 @@ namespace intercom
     g.setTextColor(s.peerOnline ? TFT_WHITE : TFT_DARKGREY);
     g.drawString(name, 14, y);
 
-    if (s.peerOnline)
+    g.setTextDatum(lgfx::textdatum_t::top_right);
+    if (s.mode == Mode::Peer)
+    {
+      g.setTextColor(s.peerSelected ? TFT_YELLOW : TFT_DARKGREY);
+      g.drawString(s.peerSelected ? "[X]" : "[ ]", _w - 4, y);
+    }
+    else if (s.peerOnline)
     {
       char rssi[12];
       snprintf(rssi, sizeof(rssi), "%d dBm", (int)s.peerRssi);
-      g.setTextDatum(lgfx::textdatum_t::top_right);
       g.setTextColor(TFT_LIGHTGREY);
       g.drawString(rssi, _w - 4, y);
     }
@@ -209,6 +242,22 @@ namespace intercom
       snprintf(volume, sizeof(volume), "VOL %u%%", (unsigned)s.volume);
       g.drawString(volume, _w - 4, y);
     }
+    else if (s.mode == Mode::Peer)
+    {
+      char pos[12];
+      if (s.peerIndex < 0)
+      {
+        snprintf(pos, sizeof(pos), "ALL");
+      }
+      else
+      {
+        snprintf(pos, sizeof(pos), "%d/%u", (int)s.peerIndex + 1,
+                 (unsigned)s.peerCount);
+      }
+      g.setTextColor(TFT_YELLOW);
+      g.drawString(pos, _w - 4, y);
+      g.setTextColor(TFT_DARKGREY);
+    }
     else if (s.transportType)
     {
       // Color-code transport: green for WiFi (local network), blue for ESP-NOW
@@ -239,6 +288,39 @@ namespace intercom
     {
       snprintf(line1, sizeof(line1), "HOLD A = TALK");
       snprintf(line2, sizeof(line2), "2X A = MODE");
+    }
+    else if (s.mode == Mode::Peer)
+    {
+      snprintf(line1, sizeof(line1), "CLICK A = SEL");
+      snprintf(line2, sizeof(line2), "HOLD A = NEXT");
+    }
+    else if (s.mode == Mode::Spy)
+    {
+      if (s.spyClip)
+      {
+        snprintf(line1, sizeof(line1), "CLICK A = STOP");
+        snprintf(line2, sizeof(line2), "SPY RECORDING");
+      }
+      else if (s.state == State::Rx)
+      {
+        snprintf(line1, sizeof(line1), "RECEIVING");
+        snprintf(line2, sizeof(line2), "2X A = MODE");
+      }
+      else if (s.spyAwait)
+      {
+        snprintf(line1, sizeof(line1), "WAITING...");
+        snprintf(line2, sizeof(line2), "2X A = MODE");
+      }
+      else if (s.spyLive)
+      {
+        snprintf(line1, sizeof(line1), "LISTENING");
+        snprintf(line2, sizeof(line2), "RELEASE A = STOP");
+      }
+      else
+      {
+        snprintf(line1, sizeof(line1), "HOLD A = LISTEN");
+        snprintf(line2, sizeof(line2), "CLICK A = REC");
+      }
     }
     else if (s.state == State::Rec)
     {

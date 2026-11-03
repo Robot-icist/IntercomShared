@@ -71,10 +71,25 @@ the UI refresh (100 ms).
 
 ## Build integration
 
-Each project sets:
+Each firmware project includes this repository as a Git submodule at
+`lib/IntercomShared`. Clone either project with its submodules:
+
+```sh
+git clone --recurse-submodules https://github.com/Robot-icist/StickS3-Intercom.git
+git clone --recurse-submodules https://github.com/Robot-icist/AtomS3R-Intercom.git
+```
+
+If a project was cloned without submodules, initialize them with:
+
+```sh
+git submodule update --init --recursive
+```
+
+PlatformIO uses the shared library from `lib/IntercomShared` and its M5Unified
+patch script. Each project also sets:
 
 ```ini
-lib_extra_dirs = ../IntercomShared
+lib_extra_dirs = lib
 lib_deps = m5stack/M5Unified@0.2.28
 ```
 

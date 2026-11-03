@@ -6,11 +6,11 @@
 
 #include "AdpcmCodec.h"
 #include "AudioEngine.h"
-#include "EspNowLink.h"
 #include "IntercomConfig.h"
 #include "IntercomTypes.h"
 #include "IntercomUi.h"
 #include "SampleRing.h"
+#include "Transport.h"
 
 namespace intercom {
 
@@ -46,7 +46,7 @@ class IntercomApp {
   int readBattery() const;
 
   AudioEngine _audio;
-  EspNowLink _link;
+  TransportManager _transport;
   IntercomUi _ui;
   SampleRing _jitter;
   SampleRing _clip;

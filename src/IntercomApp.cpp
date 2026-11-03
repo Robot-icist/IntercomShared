@@ -46,10 +46,18 @@ bool IntercomApp::begin() {
   _audio.setVolume((uint8_t)((uint16_t)_volume * 255 / 100));
   Serial.printf("[app] volume %u%%\n", (unsigned)_volume);
 
-  if (!_link.begin()) {
-    Serial.println("[app] link init failed");
+  // Initialize transport manager (ESP-NOW + WiFi)
+  if (!_transport.begin(INTERCOM_DEVICE_NAME)) {
+    Serial.println("[app] transport init failed");
     return false;
   }
+
+  // Register transport change callback for UI updates
+  _transport.onTransportChange([this](const char* type) {
+    Serial.printf("[app] Transport changed to: %s\n", type);
+    // UI will pick up peer status automatically via hasPeer()
+  });
+
   if (!_ui.begin()) {
     Serial.println("[app] display init failed");
     return false;
@@ -93,8 +101,8 @@ void IntercomApp::loop() {
   M5.update();
   handleButtons();
 
-  // Register newly discovered peers outside the Wi-Fi receive callback.
-  _link.poll();
+  // Poll transport for peer management, discovery, etc.
+  _transport.loop();
 
   uint32_t now = millis();
 
@@ -306,7 +314,10 @@ void IntercomApp::sendClipStep() {
   header->payloadLen = (uint8_t)bytes;
   memcpy(_txPacket + sizeof(PacketHeader), _adpcmFrame, bytes);
 
-  _link.send(_txPacket, sizeof(PacketHeader) + bytes);
+  Transport* t = _transport.activeTransport();
+  if (t) {
+    t->send(_txPacket, sizeof(PacketHeader) + bytes);
+  }
 
   _clipSendPos += got;
   _sendProgress.store((uint32_t)((_clipSendPos * 100) / total));
@@ -391,12 +402,20 @@ void IntercomApp::updateState() {
 }
 
 void IntercomApp::updateUi() {
+  Transport* t = _transport.activeTransport();
   UiState s;
   s.state = _state.load();
   s.mode = _mode.load();
-  s.peerOnline = _link.hasPeer();
-  _link.peerName(s.peerName, sizeof(s.peerName));
-  s.peerRssi = _link.peerRssi();
+  s.peerOnline = t ? t->hasPeer() : false;
+  if (t) {
+    t->peerName(s.peerName, sizeof(s.peerName));
+    s.peerRssi = t->peerRssi();
+    s.transportType = t->typeName();  // "ESP-NOW" or "WiFi"
+  } else {
+    s.peerName[0] = 0;
+    s.peerRssi = 0;
+    s.transportType = "none";
+  }
   s.battery = _battery.load();
   s.micLevel = _micLevel.load();
   s.rxLevel = _rxLevel.load();
@@ -411,7 +430,10 @@ void IntercomApp::updateUi() {
 void IntercomApp::sendHello() {
   int battery = _battery.load();
   uint8_t value = (battery < 0) ? 0xFF : (uint8_t)battery;
-  _link.sendHello(INTERCOM_DEVICE_NAME, value, _mode.load());
+  Transport* t = _transport.activeTransport();
+  if (t) {
+    t->sendHello(INTERCOM_DEVICE_NAME, value, _mode.load());
+  }
 }
 
 int IntercomApp::readBattery() const {
@@ -449,7 +471,10 @@ void IntercomApp::runTx() {
       header->payloadLen = (uint8_t)bytes;
       memcpy(_txPacket + sizeof(PacketHeader), _adpcmFrame, bytes);
 
-      _link.send(_txPacket, sizeof(PacketHeader) + bytes);
+      Transport* t = _transport.activeTransport();
+      if (t) {
+        t->send(_txPacket, sizeof(PacketHeader) + bytes);
+      }
       continue;
     }
 
@@ -485,7 +510,9 @@ void IntercomApp::runTx() {
 void IntercomApp::runRx() {
   RxPacket packet;
   while (true) {
-    if (!_link.popPacket(packet, 50)) {
+    Transport* t = _transport.activeTransport();
+    if (!t || !t->popPacket(packet, 50)) {
+      vTaskDelay(pdMS_TO_TICKS(10));
       continue;
     }
     if (packet.len < sizeof(PacketHeader)) {

@@ -1,0 +1,260 @@
+#pragma once
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+
+#include <atomic>
+#include <functional>
+
+#include "IntercomConfig.h"
+#include "IntercomTypes.h"
+
+namespace intercom
+{
+
+  // Transport interface - all transports implement this for unified API
+  class Transport
+  {
+  public:
+    virtual ~Transport() = default;
+
+    // Initialize transport, return true on success
+    virtual bool begin() = 0;
+
+    // Cleanup transport
+    virtual void end() = 0;
+
+    // Send audio/hello packet
+    virtual bool send(const uint8_t *data, size_t len) = 0;
+    virtual bool sendHello(const char *name, uint8_t battery, Mode mode) = 0;
+
+    // Poll for maintenance (peer management, etc.)
+    virtual bool poll() = 0;
+
+    // Check if peer is connected
+    virtual bool hasPeer() const = 0;
+    virtual void peerName(char *out, size_t outSize) const = 0;
+    virtual int8_t peerRssi() const = 0;
+    virtual uint32_t droppedPackets() const = 0;
+
+    // Get received packet
+    virtual bool popPacket(RxPacket &out, uint32_t timeoutMs = 0) = 0;
+
+    // Transport type identification
+    virtual const char *typeName() const = 0;
+    virtual bool isLocalNetwork() const = 0; // WiFi/BLE vs ESP-NOW
+
+    // Configuration callbacks
+    using ConfigCallback = std::function<void(const char *ssid, const char *pass)>;
+    virtual void setConfigCallback(ConfigCallback cb) { (void)cb; }
+  };
+
+  // ESP-NOW transport (existing implementation wrapped)
+  class EspNowTransport : public Transport
+  {
+  public:
+    bool begin() override;
+    void end() override;
+
+    bool send(const uint8_t *data, size_t len) override;
+    bool sendHello(const char *name, uint8_t battery, Mode mode) override;
+
+    bool poll() override;
+
+    bool hasPeer() const override;
+    void peerName(char *out, size_t outSize) const override;
+    int8_t peerRssi() const override { return _peerRssi.load(); }
+    uint32_t droppedPackets() const override { return _dropped.load(); }
+
+    bool popPacket(RxPacket &out, uint32_t timeoutMs = 0) override;
+
+    const char *typeName() const override { return "ESP-NOW"; }
+    bool isLocalNetwork() const override { return false; }
+
+    // Public setters for TransportManager
+    void setPeerName(const char *name)
+    {
+      if (name)
+      {
+        strncpy(_peerName, name, sizeof(_peerName) - 1);
+        _peerName[sizeof(_peerName) - 1] = 0;
+      }
+    }
+
+  private:
+    static void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len);
+    void handlePacket(const uint8_t *src, int8_t rssi, const uint8_t *data, int len);
+    void notePeer(const uint8_t *mac);
+    void updatePeerName(const char *name);
+
+    QueueHandle_t _queue = nullptr;
+    SemaphoreHandle_t _peerMutex = nullptr;
+    uint8_t _peerMac[6] = {0};
+    uint8_t _pendingMac[6] = {0};
+    bool _hasPeer = false;
+    bool _pendingPeer = false;
+    uint32_t _lastPeerAddMs = 0;
+    char _peerName[16] = {0};
+    std::atomic<bool> _peerReady{false};
+    std::atomic<uint32_t> _lastPeerMs{0};
+    std::atomic<int8_t> _peerRssi{0};
+    std::atomic<uint32_t> _dropped{0};
+
+    static EspNowTransport *g_instance;
+  };
+
+  // Fix String comparison warning
+  inline bool strEquals(const String &a, const char *b) { return a.equals(b); }
+
+  // WiFi transport using UDP for local network communication
+  class WiFiTransport : public Transport
+  {
+  public:
+    WiFiTransport();
+    ~WiFiTransport();
+
+    bool begin() override;
+    void end() override;
+
+    bool send(const uint8_t *data, size_t len) override;
+    bool sendHello(const char *name, uint8_t battery, Mode mode) override;
+
+    bool poll() override;
+
+    bool hasPeer() const override;
+    void peerName(char *out, size_t outSize) const override;
+    int8_t peerRssi() const override { return _peerRssi.load(); }
+    uint32_t droppedPackets() const override { return _dropped.load(); }
+
+    bool popPacket(RxPacket &out, uint32_t timeoutMs = 0) override;
+
+    const char *typeName() const override { return "WiFi"; }
+    bool isLocalNetwork() const override { return true; }
+
+    // WiFi configuration
+    void setConfigCallback(ConfigCallback cb) override { _configCb = cb; }
+    bool connectToWiFi(const char *ssid, const char *pass, uint32_t timeoutMs = 15000);
+    void startConfigPortal(); // Starts AP + captive portal
+    bool isConnected() const { return _wifiConnected; }
+    void setHostname(const char *name);
+    bool isWiFiConfigured() const;
+
+    // mDNS service discovery
+    void startMDNS(const char *hostname);
+    void stopMDNS();
+
+  private:
+    static void udpRecvTask(void *arg);
+    void processUDP();
+    void sendDiscovery();
+    void handleDiscoveryResponse(const IPAddress &srcIP, uint16_t port, const uint8_t *data, int len);
+    void notePeer(const IPAddress &srcIP, uint16_t port, int8_t rssi);
+    void updatePeerName(const char *name);
+
+    // WiFiManager-like configuration
+    void runConfigPortal();
+    static void configPortalTask(void *arg);
+    bool loadSavedCredentials();
+    void saveCredentials(const char *ssid, const char *pass);
+
+    QueueHandle_t _queue = nullptr;
+    SemaphoreHandle_t _peerMutex = nullptr;
+    uint8_t _peerMac[6] = {0};
+    uint16_t _peerPort = 0;
+    bool _hasPeer = false;
+    uint32_t _lastPeerMs = 0;
+    char _peerName[16] = {0};
+    std::atomic<int8_t> _peerRssi{0};
+    std::atomic<uint32_t> _dropped{0};
+    std::atomic<bool> _peerReady{false};
+
+    WiFiUDP _udp;
+    static constexpr uint16_t kIntercomPort = 42424;
+    static constexpr uint32_t kDiscoveryIntervalMs = 2000;
+    static constexpr uint32_t kPeerTimeoutMs = 5000;
+    uint32_t _lastDiscoveryMs = 0;
+    uint32_t _lastHelloMs = 0;
+
+    bool _wifiConnected = false;
+    bool _mdnsStarted = false;
+    char _hostname[32] = {0};
+    ConfigCallback _configCb = nullptr;
+
+    TaskHandle_t _udpTask = nullptr;
+    TaskHandle_t _configTask = nullptr;
+    std::atomic<bool> _running{false};
+    std::atomic<bool> _inConfigMode{false};
+
+    String _savedSsid;
+    String _savedPass;
+  };
+
+  // Transport manager - handles multiple transports, auto-selection, fallback
+  class TransportManager
+  {
+  public:
+    TransportManager() = default;
+    ~TransportManager() = default;
+
+    // Initialize with preferred transport order
+    // Returns true if at least one transport started
+    bool begin(const char *deviceName);
+
+    void loop();
+
+    // Get active transport (for sending)
+    Transport *activeTransport() { return _activeTransport; }
+
+    // Get transport by type
+    EspNowTransport *espNow() { return &_espNow; }
+    WiFiTransport *wifi() { return &_wifi; }
+
+    // Transport selection
+    void setPreferredTransport(const char *type); // "espnow", "wifi", "auto"
+    const char *currentTransportType() const;
+
+    // WiFi configuration
+    void startWiFiConfig();
+    bool isWiFiConfigured() const;
+
+    // Callbacks
+    using TransportChangeCallback = std::function<void(const char *type)>;
+    void onTransportChange(TransportChangeCallback cb) { _transportChangeCb = cb; }
+
+  private:
+    void selectBestTransport();
+    bool tryTransport(Transport *t);
+
+    EspNowTransport _espNow;
+    WiFiTransport _wifi;
+    Transport *_activeTransport = nullptr;
+    String _preferredTransport = "auto";
+    TransportChangeCallback _transportChangeCb = nullptr;
+
+    // Hardcoded WiFi credentials fallback (compile-time)
+    static constexpr const char *kFallbackSSIDs[] = {
+        // "HOME_WIFI",
+        // "OFFICE_WIFI",
+        nullptr};
+    static constexpr const char *kFallbackPasses[] = {
+        // "password123",
+        // "officepass",
+        nullptr};
+  };
+
+  // Fallback WiFi credentials (also accessible from WiFiTransport)
+  namespace
+  {
+    constexpr const char *kFallbackSSIDs[] = {
+        // "HOME_WIFI",
+        // "OFFICE_WIFI",
+        nullptr};
+    constexpr const char *kFallbackPasses[] = {
+        // "password123",
+        // "officepass",
+        nullptr};
+  }
+
+} // namespace intercom

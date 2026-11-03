@@ -73,6 +73,7 @@ struct UiState {
   uint8_t volume = 50;         // local speaker volume, 0..100
   uint32_t sampleRate = 16000;
   uint8_t channel = 1;
+  const char* transportType = "ESP-NOW";  // Current transport: "ESP-NOW", "WiFi", "none"
 };
 
 inline const char* modeName(Mode mode) {

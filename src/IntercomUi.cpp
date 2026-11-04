@@ -91,10 +91,57 @@ namespace intercom
 
   void IntercomUi::drawHeader(lgfx::LGFXBase &g, const UiState &s)
   {
+    const uint32_t now = millis();
+    const bool hasNetworkIdentity =
+        s.selfAddress[0] != 0 && s.selfMdns[0] != 0;
+    if (!hasNetworkIdentity)
+    {
+      _headerPhase = 0;
+      _headerScrollOffset = 0;
+      _lastHeaderPhaseMs = now;
+      _lastHeaderScrollMs = now;
+    }
+    else if (_headerPhase < 2 && now - _lastHeaderPhaseMs >= 2000)
+    {
+      ++_headerPhase;
+      _lastHeaderPhaseMs = now;
+      _headerScrollOffset = 0;
+    }
+
+    char identity[32] = {0};
+    const char *identityLabel =
+        s.selfName[0] ? s.selfName : INTERCOM_DEVICE_NAME;
+    if (hasNetworkIdentity && _headerPhase == 1)
+    {
+      identityLabel = s.selfAddress;
+    }
+    else if (hasNetworkIdentity && _headerPhase == 2)
+    {
+      const size_t maxCharacters = (size_t)std::max(
+          1, std::min((int)sizeof(identity) - 1, (_w - 38) / 6));
+      const size_t mdnsLength = strlen(s.selfMdns);
+      const size_t maxOffset =
+          mdnsLength > maxCharacters ? mdnsLength - maxCharacters : 0;
+      if (now - _lastHeaderScrollMs >= 500)
+      {
+        ++_headerScrollOffset;
+        _lastHeaderScrollMs = now;
+      }
+      if (_headerScrollOffset > maxOffset)
+      {
+        _headerPhase = 0;
+        _lastHeaderPhaseMs = now;
+        _headerScrollOffset = 0;
+      }
+      const size_t shown = std::min(maxCharacters, mdnsLength - _headerScrollOffset);
+      memcpy(identity, s.selfMdns + _headerScrollOffset, shown);
+      identityLabel = identity;
+    }
+
     g.setTextSize(1);
     g.setTextDatum(lgfx::textdatum_t::top_left);
     g.setTextColor(TFT_LIGHTGREY);
-    g.drawString(s.selfName[0] ? s.selfName : INTERCOM_DEVICE_NAME, 4, 2);
+    g.drawString(identityLabel, 4, 2);
 
     char battery[12];
     if (s.battery < 0)
@@ -163,21 +210,37 @@ namespace intercom
     g.fillCircle(7, y + 4, 3,
                  selected ? TFT_YELLOW : (s.peerOnline ? TFT_GREEN : TFT_DARKGREY));
 
-    // Keep the full MAC suffix visible so identical boards stay distinguishable.
-    char name[11] = {0};
-    if (s.peerName[0])
+    const uint32_t now = millis();
+    const bool hasAddress = s.peerAddress[0] != 0;
+    if (!hasAddress)
     {
-      strncpy(name, s.peerName, sizeof(name) - 1);
+      _showPeerAddress = false;
+      _lastPeerLabelSwitchMs = now;
+    }
+    else if (now - _lastPeerLabelSwitchMs >= 2000)
+    {
+      _showPeerAddress = !_showPeerAddress;
+      _lastPeerLabelSwitchMs = now;
+    }
+    char label[16] = {0};
+    if (_showPeerAddress)
+    {
+      strncpy(label, s.peerAddress, sizeof(label) - 1);
+    }
+    else if (s.peerName[0])
+    {
+      strncpy(label, s.peerName, 10);
     }
     else
     {
-      strncpy(name, "NO PEER", sizeof(name) - 1);
+      strncpy(label, "NO PEER", sizeof(label) - 1);
     }
 
     g.setTextSize(1);
     g.setTextDatum(lgfx::textdatum_t::top_left);
-    g.setTextColor(s.peerOnline ? TFT_WHITE : TFT_DARKGREY);
-    g.drawString(name, 14, y);
+    g.setTextColor(_showPeerAddress ? TFT_LIGHTGREY
+                                    : (s.peerOnline ? TFT_WHITE : TFT_DARKGREY));
+    g.drawString(label, 14, y);
 
     g.setTextDatum(lgfx::textdatum_t::top_right);
     if (s.mode == Mode::Peer)
@@ -185,7 +248,7 @@ namespace intercom
       g.setTextColor(s.peerSelected ? TFT_YELLOW : TFT_DARKGREY);
       g.drawString(s.peerSelected ? "[X]" : "[ ]", _w - 4, y);
     }
-    else if (s.peerOnline)
+    else if (s.peerOnline && !_showPeerAddress)
     {
       char rssi[12];
       snprintf(rssi, sizeof(rssi), "%d dBm", (int)s.peerRssi);

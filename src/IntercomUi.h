@@ -26,6 +26,12 @@ class IntercomUi {
   bool _useCanvas = false;
   int _w = 0;
   int _h = 0;
+  uint32_t _lastPeerLabelSwitchMs = 0;
+  bool _showPeerAddress = false;
+  uint32_t _lastHeaderPhaseMs = 0;
+  uint32_t _lastHeaderScrollMs = 0;
+  uint8_t _headerPhase = 0;
+  size_t _headerScrollOffset = 0;
 };
 
 }  // namespace intercom

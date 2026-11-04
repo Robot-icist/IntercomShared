@@ -85,6 +85,7 @@ let isSpyClip = false;
 let spyTargetPeer = null;
 
 const statusEl = document.getElementById('status');
+const localPeerNameEl = document.getElementById('local-peer-name');
 const peerNameEl = document.querySelector('.peer-name');
 const peerRssiEl = document.querySelector('.peer-rssi');
 const micLevelEl = document.querySelector('.mic-level');
@@ -105,6 +106,10 @@ const spyControlsEl = document.getElementById('spy-controls');
 const spyLiveBtn = document.getElementById('spy-live-btn');
 const spyClipBtn = document.getElementById('spy-clip-btn');
 const spyStopBtn = document.getElementById('spy-stop-btn');
+
+if (localPeerNameEl) {
+  localPeerNameEl.textContent = CONFIG.webPeerName;
+}
 
 function log(msg) {
   const time = new Date().toLocaleTimeString();

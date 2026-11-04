@@ -142,6 +142,7 @@ struct UiState {
   Mode mode = Mode::Live;
   bool peerOnline = false;
   char peerName[16] = {0};
+  char peerAddress[16] = {0};
   int8_t peerRssi = 0;
   int battery = -1;
   float micLevel = 0.0f;
@@ -158,6 +159,8 @@ struct UiState {
   bool targetAll = true;
   bool peerSelected = false;
   uint8_t selectedCount = 0;
+  char selfAddress[16] = {0};
+  char selfMdns[32] = {0};
   bool spy = false;       // spy activity on either side
   bool spyLive = false;   // live spy stream active
   bool spyClip = false;   // remote clip recording in progress

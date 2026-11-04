@@ -59,6 +59,25 @@ main {
   gap: 1.5rem;
 }
 
+#local-peer-info {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.65rem 0.85rem;
+  border: 1px solid #26385d;
+  border-radius: 10px;
+  color: #888;
+  font-size: 0.8rem;
+}
+
+#local-peer-name {
+  color: #eee;
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
 #peer-info {
   text-align: center;
   padding: 1rem;

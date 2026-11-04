@@ -640,6 +640,15 @@ void IntercomApp::updateUi() {
   s.state = _state.load();
   s.mode = _mode.load();
   strncpy(s.selfName, _deviceName, sizeof(s.selfName) - 1);
+  const IPAddress localIp = WiFi.localIP();
+  const wifi_mode_t wifiMode = WiFi.getMode();
+  if (WiFi.status() == WL_CONNECTED &&
+      localIp != IPAddress(0, 0, 0, 0) && wifiMode != WIFI_AP &&
+      wifiMode != WIFI_AP_STA) {
+    snprintf(s.selfAddress, sizeof(s.selfAddress), "%u.%u.%u.%u",
+             localIp[0], localIp[1], localIp[2], localIp[3]);
+    snprintf(s.selfMdns, sizeof(s.selfMdns), "%s-web.local", _deviceName);
+  }
   s.transportType = t ? t->typeName() : "none";
   fillPeerUi(s);
   s.battery = _battery.load();
@@ -1594,6 +1603,7 @@ bool IntercomApp::isDuplicateAudioPacket(const RxPacket& packet) {
 void IntercomApp::fillPeerUi(UiState& s) const {
   s.peerOnline = false;
   s.peerName[0] = 0;
+  s.peerAddress[0] = 0;
   s.peerRssi = 0;
   s.peerCount = 0;
   s.peerIndex = -1;
@@ -1649,10 +1659,16 @@ void IntercomApp::fillPeerUi(UiState& s) const {
           continue;
         }
         if (index == _peerIndex) {
-          strncpy(s.peerName, _peers[i].name, sizeof(s.peerName) - 1);
-          s.peerOnline = _peers[i].online;
-          s.peerRssi = _peers[i].rssi;
-          s.peerSelected = _targetAll || _peers[i].selected;
+          const Peer& peer = _peers[i];
+          strncpy(s.peerName, peer.name, sizeof(s.peerName) - 1);
+          s.peerOnline = peer.online;
+          s.peerRssi = peer.rssi;
+          s.peerSelected = _targetAll || peer.selected;
+          if (!peer.webPeer && peer.hasWifiRoute) {
+            snprintf(s.peerAddress, sizeof(s.peerAddress), "%u.%u.%u.%u",
+                     peer.wifiAddr[0], peer.wifiAddr[1], peer.wifiAddr[2],
+                     peer.wifiAddr[3]);
+          }
           break;
         }
         ++index;
@@ -1664,8 +1680,14 @@ void IntercomApp::fillPeerUi(UiState& s) const {
     // No individual selection left: sends fall back to broadcast.
     strncpy(s.peerName, "ALL", sizeof(s.peerName) - 1);
   } else if (selected == 1 && first >= 0) {
-    strncpy(s.peerName, _peers[first].name, sizeof(s.peerName) - 1);
-    s.peerRssi = _peers[first].rssi;
+    const Peer& peer = _peers[first];
+    strncpy(s.peerName, peer.name, sizeof(s.peerName) - 1);
+    s.peerRssi = peer.rssi;
+    if (!peer.webPeer && peer.hasWifiRoute) {
+      snprintf(s.peerAddress, sizeof(s.peerAddress), "%u.%u.%u.%u",
+               peer.wifiAddr[0], peer.wifiAddr[1], peer.wifiAddr[2],
+               peer.wifiAddr[3]);
+    }
   } else {
     snprintf(s.peerName, sizeof(s.peerName), "%d PEERS", selected);
   }

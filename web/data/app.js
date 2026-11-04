@@ -2,10 +2,10 @@
 function loadWebPeerName() {
   const storageKey = 'intercom-web-peer-name';
   try {
-    const savedName = localStorage.getItem(storageKey);
+    const savedName = sessionStorage.getItem(storageKey);
     if (/^WebClient-[A-F0-9]{5}$/.test(savedName || '')) return savedName;
   } catch (e) {
-    console.warn('Could not read the web peer identity from local storage:', e);
+    console.warn('Could not read the web peer identity from session storage:', e);
   }
 
   const randomBytes = new Uint8Array(3);
@@ -20,9 +20,9 @@ function loadWebPeerName() {
     byte.toString(16).padStart(2, '0')).join('').toUpperCase().slice(0, 5);
   const name = 'WebClient-' + suffix;
   try {
-    localStorage.setItem(storageKey, name);
+    sessionStorage.setItem(storageKey, name);
   } catch (e) {
-    console.warn('Could not save the web peer identity to local storage:', e);
+    console.warn('Could not save the web peer identity to session storage:', e);
   }
   return name;
 }
@@ -59,6 +59,7 @@ let helloTimer = null;
 let audioContext = null;
 let micStream = null;
 let micSource = null;
+let micGainNode = null;
 let processor = null;
 let audioCaptureStarting = false;
 let micStatusText = '';
@@ -105,7 +106,8 @@ const talkBtn = document.getElementById('talk-btn');
 const clipBtn = document.getElementById('clip-btn');
 const muteBtn = document.getElementById('mute-btn');
 const volumeSlider = document.getElementById('volume');
-const modeSelect = document.getElementById('mode');
+const micGainValueEl = document.getElementById('mic-gain-value');
+const modeToggleEl = document.getElementById('mode-toggle');
 const logEl = document.getElementById('log');
 const peerListEl = document.getElementById('peer-list');
 const peerItemsEl = document.getElementById('peer-items');
@@ -390,6 +392,10 @@ async function startAudioCapture(userInitiated) {
       micSource.disconnect();
       micSource = null;
     }
+    if (micGainNode) {
+      micGainNode.disconnect();
+      micGainNode = null;
+    }
     if (micStream) {
       micStream.getTracks().forEach(track => track.stop());
     }
@@ -431,11 +437,14 @@ async function startAudioCapture(userInitiated) {
       };
     });
     micSource = audioContext.createMediaStreamSource(micStream);
+    micGainNode = audioContext.createGain();
+    micGainNode.gain.value = Number(volumeSlider.value) / 100;
     processor = audioContext.createScriptProcessor(512, 1, 1);
     processor.onaudioprocess = (e) => {
       collectAudioFrames(e.inputBuffer.getChannelData(0));
     };
-    micSource.connect(processor);
+    micSource.connect(micGainNode);
+    micGainNode.connect(processor);
     processor.connect(audioContext.destination);
     if (audioContext.state === 'suspended') {
       try {
@@ -906,6 +915,11 @@ function handleSpyResponse(msg) {
 
 function updateUIForMode() {
   const isSpyMode = currentMode === 'spy';
+  modeToggleEl.querySelectorAll('button[data-mode]').forEach(button => {
+    const active = button.dataset.mode === currentMode;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', String(active));
+  });
   
   // Show/hide controls based on mode
   talkBtn.style.display = isSpyMode ? 'none' : 'flex';
@@ -1044,11 +1058,23 @@ muteBtn.addEventListener('click', () => {
   updateTxStatus(true);
 });
 
-modeSelect.addEventListener('change', (e) => {
-  currentMode = e.target.value;
+modeToggleEl.addEventListener('click', (event) => {
+  const button = event.target.closest('button[data-mode]');
+  if (!button || !modeToggleEl.contains(button)) return;
+  currentMode = button.dataset.mode;
   stopSpy(); // Stop any active spy when changing mode
   updateUIForMode();
   log('Mode: ' + currentMode);
+});
+
+volumeSlider.addEventListener('input', () => {
+  const gain = Number(volumeSlider.value) / 100;
+  if (micGainNode) micGainNode.gain.setTargetAtTime(
+    gain,
+    audioContext.currentTime,
+    0.015
+  );
+  micGainValueEl.textContent = volumeSlider.value + '%';
 });
 
 spyLiveBtn.addEventListener('click', () => {

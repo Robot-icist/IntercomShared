@@ -4,12 +4,14 @@
 #include <LittleFS.h>
 #include <Preferences.h>
 #include <SPIFFS.h>
+#include <esp_heap_caps.h>
 
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/ecp.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/oid.h>
 #include <mbedtls/pk.h>
+#include <mbedtls/platform.h>
 #include <mbedtls/x509_crt.h>
 
 #include <array>
@@ -22,6 +24,34 @@ namespace
 {
   constexpr char kTlsPreferencesNamespace[] = "intercomtls";
   constexpr size_t kMaxWebSocketFrameSize = 250;
+  constexpr UBaseType_t kWebSocketRxQueueDepth = 32;
+  constexpr UBaseType_t kWebSocketSendQueueDepth = 24;
+  constexpr UBaseType_t kWebSocketSendBatchSize = 12;
+  constexpr uint32_t kSendQueueErrorLogIntervalMs = 5000;
+
+  void *tlsCalloc(size_t count, size_t size)
+  {
+    return heap_caps_calloc_prefer(
+        count, size, 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  }
+
+  void tlsFree(void *memory)
+  {
+    heap_caps_free(memory);
+  }
+
+  bool configureTlsAllocator()
+  {
+    const int error = mbedtls_platform_set_calloc_free(tlsCalloc, tlsFree);
+    if (error != 0)
+    {
+      Serial.printf("[web] ERROR: Could not configure TLS allocator (%d)\n",
+                    error);
+      return false;
+    }
+    return true;
+  }
 
   struct CertificateContext
   {
@@ -49,7 +79,6 @@ namespace
 
   struct WebSocketSendWork
   {
-    intercom::WebTransport *transport;
     httpd_handle_t server;
     int socket;
     httpd_ws_type_t type;
@@ -311,10 +340,14 @@ namespace intercom
 
   bool WebTransport::begin()
   {
-    if (!_queue) _queue = xQueueCreate(16, sizeof(RxPacket));
+    if (!_queue) _queue = xQueueCreate(kWebSocketRxQueueDepth,
+                                       sizeof(RxPacket));
+    if (!_sendQueue)
+      _sendQueue = xQueueCreate(kWebSocketSendQueueDepth,
+                                sizeof(WebSocketSendWork *));
     if (!_peerMutex) _peerMutex = xSemaphoreCreateMutex();
     if (!_clientMutex) _clientMutex = xSemaphoreCreateMutex();
-    if (!_queue || !_peerMutex || !_clientMutex)
+    if (!_queue || !_sendQueue || !_peerMutex || !_clientMutex)
     {
       Serial.println("[web] ERROR: Could not allocate web transport resources");
       return false;
@@ -348,6 +381,12 @@ namespace intercom
       vQueueDelete(_queue);
       _queue = nullptr;
     }
+    if (_sendQueue)
+    {
+      clearWebSocketSendQueue();
+      vQueueDelete(_sendQueue);
+      _sendQueue = nullptr;
+    }
     if (_peerMutex)
     {
       vSemaphoreDelete(_peerMutex);
@@ -374,6 +413,7 @@ namespace intercom
       }
       _httpsServer = nullptr;
     }
+    clearWebSocketSendQueue();
 
     if (_clientMutex &&
         xSemaphoreTake(_clientMutex, pdMS_TO_TICKS(20)) == pdTRUE)
@@ -439,6 +479,16 @@ namespace intercom
   {
     if (_httpsServer) return true;
 
+    if (!configureTlsAllocator()) return false;
+    Serial.printf(
+        "[web] TLS heap before startup (internal free=%u, largest=%u, "
+        "PSRAM free=%u)\n",
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL |
+                                          MALLOC_CAP_8BIT),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                                   MALLOC_CAP_8BIT),
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
     char hostname[64];
     snprintf(hostname, sizeof(hostname), "%s-web.local",
              _deviceName[0] ? _deviceName : "intercom");
@@ -450,9 +500,10 @@ namespace intercom
     }
 
     httpd_ssl_config_t config = HTTPD_SSL_CONFIG_DEFAULT();
+    // HTTPD reserves three sockets internally in addition to this client limit.
     config.httpd.max_open_sockets = kMaxWebClients + 3;
     config.httpd.max_uri_handlers = 5;
-    config.httpd.lru_purge_enable = true;
+    config.httpd.lru_purge_enable = false;
     config.servercert =
         reinterpret_cast<const uint8_t *>(_certificatePem.c_str());
     config.servercert_len = _certificatePem.length() + 1;
@@ -469,6 +520,14 @@ namespace intercom
                     esp_err_to_name(error));
       return false;
     }
+    Serial.printf(
+        "[web] HTTPS ready (sockets=%u, internal free=%u, largest=%u, "
+        "PSRAM free=%u)\n",
+        (unsigned)config.httpd.max_open_sockets,
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                                   MALLOC_CAP_8BIT),
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     const auto registerUri = [this](const char *path, httpd_method_t method,
                                     esp_err_t (*handler)(httpd_req_t *),
@@ -600,7 +659,14 @@ namespace intercom
     xSemaphoreGive(_clientMutex);
     if (registered)
     {
-      Serial.printf("[web] WebSocket client connected (socket %d)\n", socket);
+      Serial.printf(
+          "[web] WebSocket client connected (socket %d, internal free=%u, "
+          "largest=%u)\n",
+          socket,
+          (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL |
+                                            MALLOC_CAP_8BIT),
+          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                                     MALLOC_CAP_8BIT));
     }
     else
     {
@@ -756,19 +822,24 @@ namespace intercom
           Serial.println("[web] Ignored invalid audio target");
           return ESP_OK;
         }
-        if (_peerMutex &&
-            xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(20)) == pdTRUE)
+        if (_clientMutex &&
+            xSemaphoreTake(_clientMutex, pdMS_TO_TICKS(20)) == pdTRUE)
         {
-          _audioTargetAll = targetAll;
-          if (!targetAll)
+          WebClient &client = _webClients[clientIndex];
+          if (client.active && client.port == clientPort)
           {
-            memcpy(_audioTargetMac, targetMac, sizeof(_audioTargetMac));
-            _audioTargetPort = targetPort;
-            _audioTargetViaWifi =
-                extractJsonBool(message.c_str(), "viaWifi");
-            _audioTargetWebPeer = targetWebPeer;
+            client.audioTargetAll = targetAll;
+            if (!targetAll)
+            {
+              memcpy(client.audioTargetMac, targetMac,
+                     sizeof(client.audioTargetMac));
+              client.audioTargetPort = targetPort;
+              client.audioTargetViaWifi =
+                  extractJsonBool(message.c_str(), "viaWifi");
+              client.audioTargetWebPeer = targetWebPeer;
+            }
           }
-          xSemaphoreGive(_peerMutex);
+          xSemaphoreGive(_clientMutex);
         }
       }
       else if (command == "spy")
@@ -886,7 +957,8 @@ namespace intercom
   void WebTransport::queueWebSocketFrame(int socket, const uint8_t *data,
                                           size_t len, httpd_ws_type_t type)
   {
-    if (!_httpsServer || !data || len == 0) return;
+    if (!_running || !_httpsServer || !_sendQueue || !data || len == 0)
+      return;
     const size_t allocationSize = sizeof(WebSocketSendWork) + len - 1;
     auto *work = static_cast<WebSocketSendWork *>(malloc(allocationSize));
     if (!work)
@@ -896,37 +968,84 @@ namespace intercom
       return;
     }
 
-    work->transport = this;
     work->server = _httpsServer;
     work->socket = socket;
     work->type = type;
     work->length = len;
     memcpy(work->payload, data, len);
-    const esp_err_t error =
-        httpd_queue_work(_httpsServer, sendWebSocketWork, work);
-    if (error != ESP_OK)
+    if (xQueueSend(_sendQueue, &work, 0) != pdTRUE)
     {
       free(work);
       _dropped.fetch_add(1);
-      Serial.printf("[web] ERROR: Could not queue WebSocket send: %s\n",
+      const uint32_t now = millis();
+      uint32_t last = _lastSendQueueErrorMs.load();
+      if (now - last >= kSendQueueErrorLogIntervalMs &&
+          _lastSendQueueErrorMs.compare_exchange_strong(last, now))
+      {
+        Serial.println("[web] WARNING: WebSocket send queue is full");
+      }
+      return;
+    }
+    scheduleWebSocketSend();
+  }
+
+  void WebTransport::scheduleWebSocketSend()
+  {
+    if (!_running || !_httpsServer || !_sendQueue ||
+        uxQueueMessagesWaiting(_sendQueue) == 0)
+    {
+      return;
+    }
+
+    bool expected = false;
+    if (!_sendWorkScheduled.compare_exchange_strong(expected, true)) return;
+    const esp_err_t error =
+        httpd_queue_work(_httpsServer, sendWebSocketWork, this);
+    if (error == ESP_OK) return;
+
+    _sendWorkScheduled.store(false);
+    const uint32_t now = millis();
+    uint32_t last = _lastSendQueueErrorMs.load();
+    if (now - last >= kSendQueueErrorLogIntervalMs &&
+        _lastSendQueueErrorMs.compare_exchange_strong(last, now))
+    {
+      Serial.printf("[web] WARNING: Could not schedule WebSocket send: %s\n",
                     esp_err_to_name(error));
     }
   }
 
   void WebTransport::sendWebSocketWork(void *arg)
   {
-    auto *work = static_cast<WebSocketSendWork *>(arg);
-    httpd_ws_frame_t frame = {};
-    frame.type = work->type;
-    frame.payload = work->payload;
-    frame.len = work->length;
-    const esp_err_t error =
-        httpd_ws_send_frame_async(work->server, work->socket, &frame);
-    if (error != ESP_OK)
+    auto *transport = static_cast<WebTransport *>(arg);
+    WebSocketSendWork *work = nullptr;
+    UBaseType_t sent = 0;
+    while (sent < kWebSocketSendBatchSize && transport->_sendQueue &&
+           xQueueReceive(transport->_sendQueue, &work, 0) == pdTRUE)
     {
-      work->transport->_dropped.fetch_add(1);
+      if (work->server == transport->_httpsServer)
+      {
+        httpd_ws_frame_t frame = {};
+        frame.type = work->type;
+        frame.payload = work->payload;
+        frame.len = work->length;
+        const esp_err_t error =
+            httpd_ws_send_frame_async(work->server, work->socket, &frame);
+        if (error != ESP_OK) transport->_dropped.fetch_add(1);
+      }
+      free(work);
+      ++sent;
     }
-    free(work);
+
+    transport->_sendWorkScheduled.store(false);
+    transport->scheduleWebSocketSend();
+  }
+
+  void WebTransport::clearWebSocketSendQueue()
+  {
+    if (!_sendQueue) return;
+    WebSocketSendWork *work = nullptr;
+    while (xQueueReceive(_sendQueue, &work, 0) == pdTRUE) free(work);
+    _sendWorkScheduled.store(false);
   }
 
   void WebTransport::sendWebPacket(size_t clientIndex, const uint8_t *data,
@@ -969,6 +1088,33 @@ namespace intercom
     }
   }
 
+  void WebTransport::broadcastWebPacketExcept(uint16_t excludedPort,
+                                               const uint8_t *data,
+                                               size_t len)
+  {
+    if (!data || len == 0 || !_clientMutex ||
+        xSemaphoreTake(_clientMutex, pdMS_TO_TICKS(20)) != pdTRUE)
+    {
+      return;
+    }
+
+    int sockets[kMaxWebClients];
+    size_t count = 0;
+    for (size_t i = 0; i < kMaxWebClients; ++i)
+    {
+      if (_webClients[i].active && _webClients[i].port != excludedPort)
+        sockets[count++] = _webClients[i].socket;
+    }
+    xSemaphoreGive(_clientMutex);
+
+    const bool isText = data[0] == '{';
+    for (size_t i = 0; i < count; ++i)
+    {
+      queueWebSocketFrame(sockets[i], data, len,
+                          isText ? HTTPD_WS_TYPE_TEXT : HTTPD_WS_TYPE_BINARY);
+    }
+  }
+
   void WebTransport::queueWebPacket(const uint8_t *src, uint16_t port,
                                     int8_t rssi, const uint8_t *data, int len)
   {
@@ -1004,6 +1150,7 @@ namespace intercom
     if (_ending) return false;
 
     const uint32_t now = millis();
+    scheduleWebSocketSend();
     const wifi_mode_t wifiMode = WiFi.getMode();
     const bool wifiConnected =
         WiFi.status() == WL_CONNECTED &&
@@ -1124,25 +1271,40 @@ namespace intercom
     if (data && len) broadcastWebPacket(data, len);
   }
 
-  bool WebTransport::audioTarget(uint8_t *addr, uint16_t &port,
+  void WebTransport::broadcastToWebExcept(uint16_t excludedPort,
+                                          const uint8_t *data, size_t len)
+  {
+    if (data && len) broadcastWebPacketExcept(excludedPort, data, len);
+  }
+
+  bool WebTransport::audioTarget(uint16_t clientPort, uint8_t *addr,
+                                 uint16_t &port,
                                  bool &viaWifi, bool &webPeer, bool &all) const
   {
-    if (!_peerMutex ||
-        xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) != pdTRUE)
+    if (!_clientMutex ||
+        xSemaphoreTake(_clientMutex, pdMS_TO_TICKS(10)) != pdTRUE)
     {
       all = true;
       return false;
     }
-    all = _audioTargetAll;
-    if (!all && addr)
+    bool found = false;
+    for (size_t i = 0; i < kMaxWebClients; ++i)
     {
-      memcpy(addr, _audioTargetMac, sizeof(_audioTargetMac));
-      port = _audioTargetPort;
-      viaWifi = _audioTargetViaWifi;
-      webPeer = _audioTargetWebPeer;
+      const WebClient &client = _webClients[i];
+      if (!client.active || client.port != clientPort) continue;
+      found = true;
+      all = client.audioTargetAll;
+      if (!all && addr)
+      {
+        memcpy(addr, client.audioTargetMac, sizeof(client.audioTargetMac));
+        port = client.audioTargetPort;
+        viaWifi = client.audioTargetViaWifi;
+        webPeer = client.audioTargetWebPeer;
+      }
+      break;
     }
-    xSemaphoreGive(_peerMutex);
-    return true;
+    xSemaphoreGive(_clientMutex);
+    return found;
   }
 
   void WebTransport::setTransportManager(TransportManager *mgr)

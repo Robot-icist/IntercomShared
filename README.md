@@ -108,7 +108,7 @@ When Wi-Fi is connected, the device serves the web client over HTTPS on port
 and accept the self-signed certificate in the browser. The certificate and key
 are generated on the device and persisted in NVS; a changed network IP may
 require accepting the renewed certificate. The browser microphone requires
-this trusted secure connection before granting `getUserMedia` access. To limit
-TLS memory use, only one browser WebSocket client can be connected at a time.
-The browser appears as a peer to the device and supports spy audio in either
-direction while the page remains connected.
+this trusted secure connection before granting `getUserMedia` access. Up to
+three browser WebSocket clients can connect at once; each appears as a peer
+with its own audio target. The browser supports spy audio in either direction
+while the page remains connected.

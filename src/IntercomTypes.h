@@ -42,6 +42,12 @@ constexpr uint8_t kAudioFlagWebPeer = 0x01;
 constexpr uint8_t kSpyFlagWebPeerTarget = 0x01;
 constexpr uint8_t kSpyTargetWebPeer = 0x02;
 constexpr uint16_t kWebClientPort = 1000;
+constexpr size_t kMaxWebClients = 3;
+
+constexpr bool isWebClientPort(uint16_t port) {
+  return port >= kWebClientPort &&
+         port < kWebClientPort + kMaxWebClients;
+}
 
 enum SpyCommand : uint8_t {
   kSpyLiveStart = 1,

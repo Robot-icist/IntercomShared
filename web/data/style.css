@@ -190,7 +190,7 @@ main {
   flex: 1;
 }
 
-.setting label {
+.setting label, .setting-label {
   display: block;
   font-size: 0.8rem;
   color: #888;
@@ -201,13 +201,31 @@ main {
   width: 100%;
 }
 
-.setting select {
-  width: 100%;
-  padding: 0.5rem;
+.mode-toggle {
+  display: flex;
+  gap: 0.25rem;
+  padding: 0.25rem;
   background: #16213e;
-  color: #eee;
   border: 1px solid #0f3460;
+  border-radius: 8px;
+}
+
+.mode-btn {
+  flex: 1;
+  min-width: 0;
+  padding: 0.5rem 0.35rem;
+  background: transparent;
+  color: #aaa;
+  border: 0;
   border-radius: 6px;
+  font: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.mode-btn.active {
+  background: #3498db;
+  color: #fff;
 }
 
 .log {

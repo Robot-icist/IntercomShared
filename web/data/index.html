@@ -56,15 +56,18 @@
 
       <div id="settings">
         <div class="setting">
-          <label>Volume</label>
-          <input type="range" id="volume" min="0" max="100" value="50">
+          <label for="volume">Mic gain <span id="mic-gain-value">100%</span></label>
+          <input type="range" id="volume" min="0" max="200" value="100">
         </div>
         <div class="setting">
-          <label>Mode</label>
-          <select id="mode">
-            <option value="live">Live / Clip</option>
-            <option value="spy">Spy</option>
-          </select>
+          <span class="setting-label">Mode</span>
+          <div id="mode-toggle" class="mode-toggle"
+               role="group" aria-label="Intercom mode">
+            <button type="button" class="mode-btn active"
+                    data-mode="live" aria-pressed="true">Live / Clip</button>
+            <button type="button" class="mode-btn"
+                    data-mode="spy" aria-pressed="false">Spy</button>
+          </div>
         </div>
       </div>
 

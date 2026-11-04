@@ -247,9 +247,11 @@ namespace intercom
     // Web client management
     size_t connectedClients() const;
     void broadcastToWeb(const uint8_t *data, size_t len);
-    bool audioTarget(uint8_t *addr, uint16_t &port, bool &viaWifi,
+    bool audioTarget(uint16_t clientPort, uint8_t *addr, uint16_t &port, bool &viaWifi,
                      bool &webPeer, bool &all) const;
     bool isRunning() const { return _running.load(); }
+    void broadcastToWebExcept(uint16_t excludedPort, const uint8_t *data,
+                              size_t len);
 
   private:
     static void webServerStartTask(void *arg);
@@ -267,22 +269,24 @@ namespace intercom
     bool registerWebClient(int socket, size_t &clientIndex);
     void queueWebSocketFrame(int socket, const uint8_t *data, size_t len,
                              httpd_ws_type_t type);
+    void scheduleWebSocketSend();
+    void clearWebSocketSendQueue();
     static void sendWebSocketWork(void *arg);
     void queueWebPacket(const uint8_t *src, uint16_t port, int8_t rssi,
                         const uint8_t *data, int len);
     void noteWebPeer(const uint8_t *mac, uint16_t port);
     void sendWebPacket(size_t clientIndex, const uint8_t *data, size_t len);
     void broadcastWebPacket(const uint8_t *data, size_t len);
+    void broadcastWebPacketExcept(uint16_t excludedPort, const uint8_t *data,
+                                  size_t len);
 
     QueueHandle_t _queue = nullptr;
+    QueueHandle_t _sendQueue = nullptr;
+    std::atomic<bool> _sendWorkScheduled{false};
+    std::atomic<uint32_t> _lastSendQueueErrorMs{0};
     SemaphoreHandle_t _peerMutex = nullptr;
     uint8_t _peerMac[6] = {0};
     uint16_t _peerPort = 0;
-    uint8_t _audioTargetMac[6] = {0};
-    uint16_t _audioTargetPort = 0;
-    bool _audioTargetViaWifi = false;
-    bool _audioTargetWebPeer = false;
-    bool _audioTargetAll = true;
     bool _hasPeer = false;
     uint32_t _lastPeerMs = 0;
     static constexpr uint32_t kPeerTimeoutMs = 5000;
@@ -310,8 +314,12 @@ namespace intercom
       bool active = false;
       uint32_t lastSeen = 0;
       char name[16] = {0};
+      uint8_t audioTargetMac[6] = {0};
+      uint16_t audioTargetPort = 0;
+      bool audioTargetViaWifi = false;
+      bool audioTargetWebPeer = false;
+      bool audioTargetAll = true;
     };
-    static constexpr size_t kMaxWebClients = 1;
     WebClient _webClients[kMaxWebClients];
     SemaphoreHandle_t _clientMutex = nullptr;
     uint32_t _lastServerAttemptMs = 0;

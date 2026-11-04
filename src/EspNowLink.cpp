@@ -90,18 +90,22 @@ bool EspNowLink::send(const uint8_t* data, size_t len) {
 }
 
 bool EspNowLink::sendHello(const char* name, uint8_t battery, Mode mode) {
-  alignas(4) uint8_t buf[sizeof(PacketHeader) + sizeof(HelloPayload)];
+  alignas(4) uint8_t buf[sizeof(PacketHeader) + sizeof(HelloPayload) +
+                         sizeof(HelloDeviceIdentity)] = {};
   PacketHeader* header = (PacketHeader*)buf;
   HelloPayload* payload = (HelloPayload*)(buf + sizeof(PacketHeader));
+  HelloDeviceIdentity* identity =
+      (HelloDeviceIdentity*)(buf + sizeof(PacketHeader) +
+                             sizeof(HelloPayload));
 
   header->magic = kMagic;
   header->version = kVersion;
   header->type = kPacketHello;
-  header->flags = 0;
+  header->flags = kHelloFlagHasDeviceMac;
   header->seq = 0;
   header->predictor = 0;
   header->adpcmIndex = 0;
-  header->payloadLen = sizeof(HelloPayload);
+  header->payloadLen = sizeof(HelloPayload) + sizeof(HelloDeviceIdentity);
 
   payload->battery = battery;
   payload->mode = (uint8_t)mode;
@@ -109,6 +113,7 @@ bool EspNowLink::sendHello(const char* name, uint8_t battery, Mode mode) {
   if (name) {
     strncpy(payload->name, name, sizeof(payload->name) - 1);
   }
+  WiFi.macAddress(identity->mac);
 
   return send(buf, sizeof(buf));
 }

@@ -1,6 +1,7 @@
 #include "IntercomApp.h"
 
 #include <Preferences.h>
+#include <LittleFS.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -11,6 +12,24 @@ namespace intercom {
 bool IntercomApp::begin() {
   Serial.begin(115200);
   delay(50);
+
+  // Mount LittleFS filesystem for web server
+  if (!LittleFS.begin()) {
+    Serial.println("[app] LittleFS mount failed");
+  } else {
+    Serial.println("[app] LittleFS mounted successfully");
+    // List contents for debugging
+    File root = LittleFS.open("/");
+    if (root) {
+      Serial.println("[app] LittleFS contents:");
+      File file = root.openNextFile();
+      while (file) {
+        Serial.printf("  %s (%d bytes)\n", file.name(), file.size());
+        file = root.openNextFile();
+      }
+      root.close();
+    }
+  }
 
   auto cfg = M5.config();
 #if defined(INTERCOM_BOARD_ATOMS3R)
@@ -243,8 +262,9 @@ void IntercomApp::handleButtons() {
       }
       memcpy(_spyTargetAddr, peer.addr, sizeof(_spyTargetAddr));
       _spyTargetPort = peer.port;
+      _spyTargetWebPeer = peer.webPeer;
       _jitter.clear();
-      sendSpyCommand(kSpyLiveStart, peer.addr, peer.port);
+      sendSpyCommand(kSpyLiveStart, peer.addr, peer.port, peer.webPeer);
       _spyRequestLive.store(true);
       _spyRequestUntilMs = millis() + kSpyLiveMaxMs;
     }
@@ -252,14 +272,16 @@ void IntercomApp::handleButtons() {
 
   if (M5.BtnA.wasReleased()) {
     if (_spyRequestLive.load()) {
-      sendSpyCommand(kSpyLiveStop, _spyTargetAddr, _spyTargetPort);
+      sendSpyCommand(kSpyLiveStop, _spyTargetAddr, _spyTargetPort,
+                     _spyTargetWebPeer);
       _spyRequestLive.store(false);
     }
   }
 
   if (M5.BtnA.wasSingleClicked()) {
     if (_spyRequestClip.load()) {
-      sendSpyCommand(kSpyClipStop, _spyTargetAddr, _spyTargetPort);
+      sendSpyCommand(kSpyClipStop, _spyTargetAddr, _spyTargetPort,
+                     _spyTargetWebPeer);
       _spyRequestClip.store(false);
       _spyAwaitClip.store(true);
       _spyRequestUntilMs = millis() + kSpyClipTimeoutMs;
@@ -272,8 +294,9 @@ void IntercomApp::handleButtons() {
       }
       memcpy(_spyTargetAddr, peer.addr, sizeof(_spyTargetAddr));
       _spyTargetPort = peer.port;
+      _spyTargetWebPeer = peer.webPeer;
       _jitter.clear();
-      sendSpyCommand(kSpyClipStart, peer.addr, peer.port);
+      sendSpyCommand(kSpyClipStart, peer.addr, peer.port, peer.webPeer);
       _spyRequestClip.store(true);
       _spyRequestUntilMs = millis() + kSpyClipTimeoutMs;
     }
@@ -360,6 +383,7 @@ void IntercomApp::stopClipRecordAndSend() {
            sizeof(_clipTargets[0].addr));
     _clipTargets[0].port = _spyRequesterPort;
     _clipTargets[0].viaWifi = _spyRequesterPort != 0;
+    _clipTargets[0].webPeer = false;
   } else {
     bool all = false;
     _clipTargetCount = collectTargets(_clipTargets, kMaxPeers, all);
@@ -453,7 +477,15 @@ void IntercomApp::sendClipStep() {
     broadcastAll(_txPacket, len);
   } else {
     for (size_t i = 0; i < _clipTargetCount; ++i) {
-      sendToPeer(_clipTargets[i].addr, _clipTargets[i].port, _txPacket, len);
+      if (_clipTargets[i].webPeer) {
+        uint8_t targetPacket[kMaxPacketSize];
+        memcpy(targetPacket, _txPacket, len);
+        ((PacketHeader*)targetPacket)->flags |= kAudioFlagWebPeer;
+        sendToPeer(_clipTargets[i].addr, _clipTargets[i].port, targetPacket,
+                   len);
+      } else {
+        sendToPeer(_clipTargets[i].addr, _clipTargets[i].port, _txPacket, len);
+      }
     }
   }
 
@@ -578,10 +610,145 @@ void IntercomApp::updateUi() {
 void IntercomApp::sendHello() {
   int battery = _battery.load();
   uint8_t value = (battery < 0) ? 0xFF : (uint8_t)battery;
-  Transport* t = _transport.activeTransport();
-  if (t) {
-    t->sendHello(_deviceName, value, _mode.load());
+  // Send on all transports so web clients and WiFi peers both see us
+  Transport* transports[] = {
+    (Transport*)_transport.espNow(),
+    (Transport*)_transport.wifi(),
+    (Transport*)_transport.web()
+  };
+  for (int i = 0; i < 3; ++i) {
+    if (transports[i]) {
+      transports[i]->sendHello(_deviceName, value, _mode.load());
+    }
   }
+  sendWebPeerAnnouncements();
+  sendWebPeerList();
+}
+
+void IntercomApp::sendWebPeerAnnouncements() {
+  Peer webPeers[kMaxPeers];
+  size_t count = 0;
+  if (!_peerMutex || xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+    return;
+  }
+  for (size_t i = 0; i < kMaxPeers; ++i) {
+    if (_peers[i].used && _peers[i].online &&
+        _peers[i].port == kWebClientPort) {
+      webPeers[count++] = _peers[i];
+    }
+  }
+  xSemaphoreGive(_peerMutex);
+
+  for (size_t i = 0; i < count; ++i) {
+    alignas(4) uint8_t packet[sizeof(PacketHeader) + sizeof(HelloPayload)] = {};
+    PacketHeader* header = (PacketHeader*)packet;
+    HelloPayload* hello = (HelloPayload*)(packet + sizeof(PacketHeader));
+    header->magic = kMagic;
+    header->version = kVersion;
+    header->type = kPacketHello;
+    header->flags = kHelloFlagWebPeer;
+    header->payloadLen = sizeof(HelloPayload);
+    hello->battery = webPeers[i].battery;
+    hello->mode = webPeers[i].mode;
+    strncpy(hello->name, webPeers[i].name, sizeof(hello->name) - 1);
+    _transport.espNow()->broadcast(packet, sizeof(packet));
+    _transport.wifi()->broadcast(packet, sizeof(packet));
+  }
+}
+
+void IntercomApp::sendWebPeerList() {
+  char message[1200] = "{\"type\":\"peer_list\",\"peers\":[";
+  size_t used = strlen(message);
+  bool first = true;
+  auto appendPeer = [&](const uint8_t* addr, const uint8_t* identityMac,
+                        bool hasIdentityMac, uint16_t port, const char* name,
+                        int8_t rssi, uint8_t battery, uint8_t mode,
+                        bool viaWifi, bool webPeer) {
+    char id[24];
+    if (webPeer) {
+      uint32_t hash = 2166136261u;
+      for (const unsigned char* p =
+               reinterpret_cast<const unsigned char*>(name);
+           *p; ++p) {
+        hash = (hash ^ *p) * 16777619u;
+      }
+      snprintf(id, sizeof(id), "web:%08lX", (unsigned long)hash);
+    } else if (hasIdentityMac) {
+      snprintf(id, sizeof(id), "esp:%02X%02X%02X%02X%02X%02X",
+               identityMac[0], identityMac[1], identityMac[2],
+               identityMac[3], identityMac[4], identityMac[5]);
+    } else {
+      uint32_t hash = 2166136261u;
+      for (const unsigned char* p =
+               reinterpret_cast<const unsigned char*>(name);
+           *p; ++p) {
+        hash = (hash ^ *p) * 16777619u;
+      }
+      snprintf(id, sizeof(id), "peer:%08lX", (unsigned long)hash);
+    }
+    int written = snprintf(message + used, sizeof(message) - used,
+                           "%s{\"id\":\"%s\",\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\","
+                           "\"port\":%u,\"viaWifi\":%s,\"webPeer\":%s,\"name\":\"",
+                           first ? "" : ",", id,
+                           addr[0], addr[1], addr[2], addr[3], addr[4], addr[5],
+                           port, viaWifi ? "true" : "false",
+                           webPeer ? "true" : "false");
+    if (written < 0 || (size_t)written >= sizeof(message) - used) return false;
+    used += (size_t)written;
+    for (const unsigned char* p =
+             reinterpret_cast<const unsigned char*>(name);
+         *p; ++p) {
+      if (*p == '"' || *p == '\\') {
+        if (used + 2 >= sizeof(message)) return false;
+        message[used++] = '\\';
+        message[used++] = (char)*p;
+      } else if (*p >= 0x20) {
+        if (used + 1 >= sizeof(message)) return false;
+        message[used++] = (char)*p;
+      }
+    }
+    written = snprintf(message + used, sizeof(message) - used,
+                       "\",\"rssi\":%d,\"battery\":%u,\"mode\":%u}",
+                       rssi, battery == 0xFF ? 255 : battery, mode);
+    if (written < 0 || (size_t)written >= sizeof(message) - used) return false;
+    used += (size_t)written;
+    first = false;
+    return true;
+  };
+
+  const int battery = _battery.load();
+  if (!appendPeer(_selfMac, _selfMac, true, 0, _deviceName, 0,
+                  battery < 0 ? 0xFF : (uint8_t)battery,
+                  (uint8_t)_mode.load(), false, false)) {
+    return;
+  }
+
+  Peer peers[kMaxPeers];
+  size_t count = 0;
+  if (_peerMutex && xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    for (size_t i = 0; i < kMaxPeers; ++i) {
+      if (_peers[i].used && _peers[i].online &&
+          _peers[i].port != kWebClientPort &&
+          memcmp(_peers[i].addr, _selfMac, sizeof(_selfMac)) != 0) {
+        peers[count++] = _peers[i];
+      }
+    }
+    xSemaphoreGive(_peerMutex);
+  }
+  for (size_t i = 0; i < count; ++i) {
+    if (!appendPeer(peers[i].addr,
+                    peers[i].identityMac,
+                    peers[i].hasIdentityMac,
+                    peers[i].port, peers[i].name,
+                    peers[i].rssi, peers[i].battery, peers[i].mode,
+                    peers[i].viaWifi, peers[i].webPeer)) {
+      return;
+    }
+  }
+  if (used + 3 >= sizeof(message)) return;
+  memcpy(message + used, "]}", 3);
+  _transport.web()->broadcastToWeb(
+      reinterpret_cast<const uint8_t*>(message), used + 2);
 }
 
 int IntercomApp::readBattery() const {
@@ -659,10 +826,23 @@ void IntercomApp::runTx() {
 
 void IntercomApp::runRx() {
   RxPacket packet;
+  size_t nextTransport = 0;
   while (true) {
-    Transport* t = _transport.activeTransport();
-    if (!t || !t->popPacket(packet, 50)) {
-      vTaskDelay(pdMS_TO_TICKS(10));
+    bool gotPacket = false;
+    Transport* transports[] = {
+      (Transport*)_transport.espNow(),
+      (Transport*)_transport.wifi(),
+      (Transport*)_transport.web()
+    };
+    for (size_t i = 0; i < 3 && !gotPacket; ++i) {
+      const size_t index = (nextTransport + i) % 3;
+      if (transports[index] && transports[index]->popPacket(packet, 0)) {
+        gotPacket = true;
+        nextTransport = (index + 1) % 3;
+      }
+    }
+    if (!gotPacket) {
+      vTaskDelay(pdMS_TO_TICKS(5));
       continue;
     }
     if (packet.len < sizeof(PacketHeader)) {
@@ -686,8 +866,76 @@ void IntercomApp::runRx() {
     if (header->type != kPacketAudio || header->payloadLen == 0) {
       continue;
     }
-    if (!acceptAudio(packet.src, packet.port)) {
+    if (routeSpyRelayPacket(packet)) {
       continue;
+    }
+    if (isLocalNetworkSource(packet)) {
+      continue;
+    }
+    if (header->flags & kAudioFlagWebPeer) {
+      if (isDuplicateAudioPacket(packet)) {
+        continue;
+      }
+      if (!_transport.web()->broadcast(packet.data, packet.len)) {
+        Serial.println("[web] Could not forward audio to the web peer");
+      }
+      continue;
+    }
+    const bool webSpyAudio =
+        packet.port == _spyTargetPort && packet.port == kWebClientPort &&
+        (_spyRequestLive.load() || _spyRequestClip.load() ||
+         _spyAwaitClip.load()) &&
+        memcmp(packet.src, _spyTargetAddr, sizeof(_spyTargetAddr)) == 0;
+    if (!webSpyAudio && packet.port != kWebClientPort &&
+        !acceptAudio(packet.src, packet.port)) {
+      continue;
+    }
+    if (isDuplicateAudioPacket(packet)) {
+      continue;
+    }
+
+    if (packet.port == kWebClientPort && !webSpyAudio) {
+      uint8_t targetAddr[6] = {};
+      uint16_t targetPort = 0;
+      bool targetViaWifi = false;
+      bool targetWebPeer = false;
+      bool targetAll = true;
+      if (!_transport.web()->audioTarget(targetAddr, targetPort,
+                                         targetViaWifi, targetWebPeer,
+                                         targetAll)) {
+        continue;
+      }
+
+      bool routed = false;
+      bool playLocally = false;
+      if (targetAll) {
+        routed = _transport.espNow()->broadcast(packet.data, packet.len);
+        routed = _transport.wifi()->broadcast(packet.data, packet.len) ||
+                 routed;
+        broadcastToWebPeers(packet.data, packet.len);
+        playLocally = true;
+      } else if (memcmp(targetAddr, _selfMac, sizeof(targetAddr)) == 0) {
+        routed = true;
+        playLocally = true;
+      } else {
+        uint8_t targetPacket[kMaxPacketSize];
+        memcpy(targetPacket, packet.data, packet.len);
+        if (targetWebPeer)
+          ((PacketHeader*)targetPacket)->flags |= kAudioFlagWebPeer;
+        if (targetWebPeer && targetViaWifi) {
+          routed = _transport.wifi()->sendTo(targetAddr, targetPort,
+                                             targetPacket, packet.len);
+        } else {
+          routed = sendToPeer(targetAddr, targetPort, targetPacket,
+                              packet.len);
+        }
+      }
+      if (!routed) {
+        Serial.println("[web] Audio target is unavailable");
+      }
+      if (!playLocally) {
+        continue;
+      }
     }
 
     if (!_haveLastAudioSrc ||
@@ -775,6 +1023,17 @@ void IntercomApp::updatePeer(const RxPacket& packet) {
   }
   const HelloPayload* hello =
       (const HelloPayload*)(packet.data + sizeof(PacketHeader));
+  const bool webPeer = packet.port == kWebClientPort ||
+                       (header->flags & kHelloFlagWebPeer) != 0;
+  const bool hasIdentityMac =
+      !webPeer && (header->flags & kHelloFlagHasDeviceMac) != 0 &&
+      header->payloadLen >=
+          sizeof(HelloPayload) + sizeof(HelloDeviceIdentity);
+  const HelloDeviceIdentity* identity =
+      hasIdentityMac
+          ? (const HelloDeviceIdentity*)(packet.data + sizeof(PacketHeader) +
+                                         sizeof(HelloPayload))
+          : nullptr;
 
   if (strncmp(hello->name, _deviceName, sizeof(_deviceName)) == 0) {
     return;
@@ -785,7 +1044,8 @@ void IntercomApp::updatePeer(const RxPacket& packet) {
     }
   } else {
     IPAddress local = WiFi.localIP();
-    if (packet.src[0] == local[0] && packet.src[1] == local[1] &&
+    if (local != IPAddress(0, 0, 0, 0) &&
+        packet.src[0] == local[0] && packet.src[1] == local[1] &&
         packet.src[2] == local[2] && packet.src[3] == local[3]) {
       return;
     }
@@ -798,11 +1058,47 @@ void IntercomApp::updatePeer(const RxPacket& packet) {
   int slot = -1;
   bool existing = false;
   for (size_t i = 0; i < kMaxPeers; ++i) {
-    if (_peers[i].used && _peers[i].port == packet.port &&
-        memcmp(_peers[i].addr, packet.src, sizeof(_peers[i].addr)) == 0) {
-      slot = (int)i;
-      existing = true;
-      break;
+    if (!_peers[i].used || _peers[i].webPeer != webPeer) {
+      continue;
+    }
+    const bool sameName =
+        strncmp(_peers[i].name, hello->name, sizeof(_peers[i].name)) == 0;
+    const bool sameIdentity =
+        hasIdentityMac && _peers[i].hasIdentityMac &&
+        memcmp(_peers[i].identityMac, identity->mac,
+               sizeof(_peers[i].identityMac)) == 0;
+    const bool samePeer = sameName || sameIdentity;
+    if (samePeer) {
+      if (slot < 0) {
+        slot = (int)i;
+        existing = true;
+      } else {
+        Peer& primary = _peers[slot];
+        const Peer& duplicate = _peers[i];
+        primary.selected = primary.selected || duplicate.selected;
+        if (!primary.hasIdentityMac && duplicate.hasIdentityMac) {
+          memcpy(primary.identityMac, duplicate.identityMac,
+                 sizeof(primary.identityMac));
+          primary.hasIdentityMac = true;
+        }
+        if (!primary.hasEspNowRoute && duplicate.hasEspNowRoute) {
+          primary.hasEspNowRoute = true;
+          primary.lastEspNowMs = duplicate.lastEspNowMs;
+          if (primary.port != 0) {
+            memcpy(primary.addr, duplicate.addr, sizeof(primary.addr));
+            primary.port = 0;
+            primary.viaWifi = false;
+          }
+        }
+        if (!primary.hasWifiRoute && duplicate.hasWifiRoute) {
+          primary.hasWifiRoute = true;
+          primary.lastWifiMs = duplicate.lastWifiMs;
+          memcpy(primary.wifiAddr, duplicate.wifiAddr,
+                 sizeof(primary.wifiAddr));
+          primary.wifiPort = duplicate.wifiPort;
+        }
+        _peers[i] = Peer();
+      }
     }
   }
   if (slot < 0) {
@@ -832,19 +1128,56 @@ void IntercomApp::updatePeer(const RxPacket& packet) {
     peer = Peer();
     peer.used = true;
   }
-  memcpy(peer.addr, packet.src, sizeof(peer.addr));
-  peer.port = packet.port;
-  peer.viaWifi = packet.port != 0;
+  const uint32_t now = millis();
+  if (packet.port == 0) {
+    memcpy(peer.addr, packet.src, sizeof(peer.addr));
+    peer.port = packet.port;
+    peer.viaWifi = false;
+    peer.hasEspNowRoute = true;
+    peer.lastEspNowMs = now;
+  } else if (packet.port != kWebClientPort) {
+    memcpy(peer.wifiAddr, packet.src, sizeof(peer.wifiAddr));
+    peer.wifiPort = packet.port;
+    peer.hasWifiRoute = true;
+    peer.lastWifiMs = now;
+    const bool espNowRecent =
+        peer.hasEspNowRoute && now - peer.lastEspNowMs <= kPeerTimeoutMs;
+    if (!espNowRecent) {
+      memcpy(peer.addr, peer.wifiAddr, sizeof(peer.addr));
+      peer.port = peer.wifiPort;
+      peer.viaWifi = true;
+    }
+  } else if (!existing) {
+    memcpy(peer.addr, packet.src, sizeof(peer.addr));
+    peer.port = packet.port;
+    peer.viaWifi = false;
+  }
+  if (identity) {
+    memcpy(peer.identityMac, identity->mac, sizeof(peer.identityMac));
+    peer.hasIdentityMac = true;
+  }
+  peer.webPeer = webPeer;
   peer.battery = hello->battery;
   peer.mode = hello->mode;
   peer.rssi = packet.rssi;
-  peer.lastSeenMs = millis();
+  peer.lastSeenMs = now;
   peer.online = true;
   peer.receiveOnly = (header->flags & kHelloFlagReceiveOnly) != 0;
   strncpy(peer.name, hello->name, sizeof(peer.name) - 1);
   peer.name[sizeof(peer.name) - 1] = 0;
+  char registeredName[sizeof(peer.name)];
+  strncpy(registeredName, peer.name, sizeof(registeredName) - 1);
+  registeredName[sizeof(registeredName) - 1] = 0;
 
   xSemaphoreGive(_peerMutex);
+
+  if (!existing) {
+    Serial.printf("[peer] Registered %s via %s (port %u)\n", registeredName,
+                  packet.port == kWebClientPort ? "web" :
+                  packet.port != 0 ? "WiFi" : "ESP-NOW",
+                  packet.port);
+  }
+  sendWebPeerList();
 }
 
 void IntercomApp::expirePeers() {
@@ -854,7 +1187,26 @@ void IntercomApp::expirePeers() {
 
   const uint32_t now = millis();
   bool removed = false;
+  bool routeChanged = false;
   for (size_t i = 0; i < kMaxPeers; ++i) {
+    Peer& peer = _peers[i];
+    if (peer.used && !peer.webPeer) {
+      if (peer.hasEspNowRoute &&
+          now - peer.lastEspNowMs > kPeerTimeoutMs) {
+        peer.hasEspNowRoute = false;
+      }
+      if (peer.hasWifiRoute && now - peer.lastWifiMs > kPeerTimeoutMs) {
+        peer.hasWifiRoute = false;
+      }
+      if (!peer.hasEspNowRoute && peer.hasWifiRoute &&
+          (!peer.viaWifi || peer.port != peer.wifiPort ||
+           memcmp(peer.addr, peer.wifiAddr, sizeof(peer.addr)) != 0)) {
+        memcpy(peer.addr, peer.wifiAddr, sizeof(peer.addr));
+        peer.port = peer.wifiPort;
+        peer.viaWifi = true;
+        routeChanged = true;
+      }
+    }
     if (_peers[i].used && (uint32_t)(now - _peers[i].lastSeenMs) > kPeerTimeoutMs) {
       _peers[i].used = false;
       removed = true;
@@ -881,6 +1233,9 @@ void IntercomApp::expirePeers() {
   }
 
   xSemaphoreGive(_peerMutex);
+  if (routeChanged) {
+    sendWebPeerList();
+  }
 }
 
 bool IntercomApp::peerAt(int index, Peer& out) const {
@@ -997,6 +1352,7 @@ size_t IntercomApp::collectTargets(Target* out, size_t max, bool& all) const {
     memcpy(out[count].addr, _peers[i].addr, sizeof(out[count].addr));
     out[count].port = _peers[i].port;
     out[count].viaWifi = _peers[i].viaWifi;
+    out[count].webPeer = _peers[i].webPeer;
     ++count;
   }
   if (count == 0) {
@@ -1011,9 +1367,26 @@ bool IntercomApp::sendToPeer(const uint8_t* addr, uint16_t port,
   if (!addr || !data || len == 0) {
     return false;
   }
-  Transport* t = (port != 0) ? (Transport*)_transport.wifi()
-                             : (Transport*)_transport.espNow();
+  Transport* t = nullptr;
+  if (port == kWebClientPort) {
+    t = (Transport*)_transport.web();
+  } else if (port != 0) {
+    t = (Transport*)_transport.wifi();
+  } else {
+    t = (Transport*)_transport.espNow();
+  }
   return t ? t->sendTo(addr, port, data, len) : false;
+}
+
+bool IntercomApp::isLocalNetworkSource(const RxPacket& packet) const {
+  if (packet.port == 0) {
+    return memcmp(packet.src, _selfMac, sizeof(_selfMac)) == 0;
+  }
+
+  const IPAddress local = WiFi.localIP();
+  return local != IPAddress(0, 0, 0, 0) &&
+         packet.src[0] == local[0] && packet.src[1] == local[1] &&
+         packet.src[2] == local[2] && packet.src[3] == local[3];
 }
 
 bool IntercomApp::broadcastAll(const uint8_t* data, size_t len) {
@@ -1021,6 +1394,33 @@ bool IntercomApp::broadcastAll(const uint8_t* data, size_t len) {
   // ATOM Lite speaker still hear ALL traffic when the manager prefers WiFi.
   bool ok = _transport.espNow()->broadcast(data, len);
   ok = _transport.wifi()->broadcast(data, len) || ok;
+  ok = _transport.web()->broadcast(data, len) || ok;
+  broadcastToWebPeers(data, len);
+  return ok;
+}
+
+bool IntercomApp::broadcastToWebPeers(const uint8_t* data, size_t len) {
+  if (!data || len < sizeof(PacketHeader) || len > kMaxPacketSize) {
+    return false;
+  }
+  bool hasWebPeer = false;
+  if (!_peerMutex || xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+    return false;
+  }
+  for (size_t i = 0; i < kMaxPeers; ++i) {
+    if (_peers[i].used && _peers[i].online && _peers[i].webPeer) {
+      hasWebPeer = true;
+      break;
+    }
+  }
+  xSemaphoreGive(_peerMutex);
+  if (!hasWebPeer) return false;
+
+  uint8_t packet[kMaxPacketSize];
+  memcpy(packet, data, len);
+  ((PacketHeader*)packet)->flags |= kAudioFlagWebPeer;
+  bool ok = _transport.espNow()->broadcast(packet, len);
+  ok = _transport.wifi()->broadcast(packet, len) || ok;
   return ok;
 }
 
@@ -1033,9 +1433,41 @@ bool IntercomApp::sendToTargets(const uint8_t* data, size_t len) {
   }
   bool ok = false;
   for (size_t i = 0; i < count; ++i) {
-    ok = sendToPeer(targets[i].addr, targets[i].port, data, len) || ok;
+    if (targets[i].webPeer && len >= sizeof(PacketHeader)) {
+      uint8_t targetPacket[kMaxPacketSize];
+      memcpy(targetPacket, data, len);
+      ((PacketHeader*)targetPacket)->flags |= kAudioFlagWebPeer;
+      ok = sendToPeer(targets[i].addr, targets[i].port, targetPacket, len) || ok;
+    } else {
+      ok = sendToPeer(targets[i].addr, targets[i].port, data, len) || ok;
+    }
   }
   return ok;
+}
+
+bool IntercomApp::isDuplicateAudioPacket(const RxPacket& packet) {
+  constexpr uint32_t kDuplicateWindowMs = 1000;
+  uint32_t hash = 2166136261u;
+  for (size_t i = 0; i < packet.len; ++i) {
+    hash = (hash ^ packet.data[i]) * 16777619u;
+  }
+
+  const uint32_t now = millis();
+  for (const RecentAudioPacket& recent : _recentAudioPackets) {
+    if (recent.len == packet.len && recent.hash == hash &&
+        now - recent.receivedAtMs <= kDuplicateWindowMs) {
+      return true;
+    }
+  }
+
+  RecentAudioPacket& recent =
+      _recentAudioPackets[_recentAudioPacketIndex++ %
+                          (sizeof(_recentAudioPackets) /
+                           sizeof(_recentAudioPackets[0]))];
+  recent.hash = hash;
+  recent.len = packet.len;
+  recent.receivedAtMs = now;
+  return false;
 }
 
 void IntercomApp::fillPeerUi(UiState& s) const {
@@ -1126,8 +1558,74 @@ void IntercomApp::handleSpyPacket(const RxPacket& packet) {
   if (header->payloadLen < sizeof(SpyPayload)) {
     return;
   }
-  const uint8_t command =
-      ((const SpyPayload*)(packet.data + sizeof(PacketHeader)))->command;
+  const SpyPayload* payload =
+      (const SpyPayload*)(packet.data + sizeof(PacketHeader));
+  const uint8_t command = payload->command;
+
+  if (packet.port == kWebClientPort &&
+      header->payloadLen >= sizeof(SpyTargetPayload)) {
+    const SpyTargetPayload* target =
+        (const SpyTargetPayload*)(packet.data + sizeof(PacketHeader));
+    const bool localTarget =
+        (target->port == 0 &&
+         memcmp(target->addr, _selfMac, sizeof(_selfMac)) == 0) ||
+        (target->port != 0 && target->port != kWebClientPort &&
+         target->addr[0] == WiFi.localIP()[0] &&
+         target->addr[1] == WiFi.localIP()[1] &&
+         target->addr[2] == WiFi.localIP()[2] &&
+         target->addr[3] == WiFi.localIP()[3]);
+    _pendingSpyFromWeb = !localTarget;
+    memcpy(_pendingSpyTargetAddr, target->addr,
+           sizeof(_pendingSpyTargetAddr));
+    _pendingSpyTargetPort = target->port;
+    _pendingSpyTargetFlags = target->flags;
+    memcpy(_pendingSpyAddr, packet.src, sizeof(_pendingSpyAddr));
+    _pendingSpyPort = packet.port;
+    _pendingSpyCmd.store(command);
+    return;
+  }
+
+  if (_spyRelayActive.load()) {
+    const bool fromTarget =
+        _spyRelayFromWeb
+            ? packet.port == _spyRelayTargetPort &&
+                  memcmp(packet.src, _spyRelayTargetAddr,
+                         sizeof(_spyRelayTargetAddr)) == 0
+            : packet.port == kWebClientPort;
+    if (fromTarget) {
+      const bool forwarded =
+          _spyRelayFromWeb
+              ? _transport.web()->sendTo(_spyRelayRequesterAddr,
+                                         _spyRelayRequesterPort,
+                                         packet.data, packet.len)
+              : sendToPeer(_spyRelayRequesterAddr, _spyRelayRequesterPort,
+                           packet.data, packet.len);
+      if (!forwarded) {
+        Serial.println("[spy] Could not relay spy response");
+      }
+      if (command == kSpyClipDone || command == kSpyBusy) {
+        _spyRelayActive.store(false);
+      }
+      return;
+    }
+  }
+
+  if ((header->flags & kSpyFlagWebPeerTarget) != 0 &&
+      packet.port != kWebClientPort) {
+    if (command == kSpyLiveStart || command == kSpyClipStart) {
+      memcpy(_spyRelayRequesterAddr, packet.src,
+             sizeof(_spyRelayRequesterAddr));
+      _spyRelayRequesterPort = packet.port;
+      _spyRelayFromWeb = false;
+      _spyRelayActive.store(true);
+    }
+    _transport.web()->sendTo(packet.src, kWebClientPort,
+                             packet.data, packet.len);
+    if (command == kSpyLiveStop) {
+      _spyRelayActive.store(false);
+    }
+    return;
+  }
 
   const bool fromTarget =
       packet.port == _spyTargetPort &&
@@ -1146,6 +1644,7 @@ void IntercomApp::handleSpyPacket(const RxPacket& packet) {
     return;
   }
 
+  _pendingSpyFromWeb = false;
   memcpy(_pendingSpyAddr, packet.src, sizeof(_pendingSpyAddr));
   _pendingSpyPort = packet.port;
   _pendingSpyCmd.store(command);
@@ -1154,6 +1653,31 @@ void IntercomApp::handleSpyPacket(const RxPacket& packet) {
 void IntercomApp::handlePendingSpy() {
   const uint8_t command = _pendingSpyCmd.exchange(0);
   if (command == 0) {
+    return;
+  }
+
+  if (_pendingSpyFromWeb) {
+    _pendingSpyFromWeb = false;
+    if (command == kSpyLiveStart || command == kSpyClipStart) {
+      memcpy(_spyRelayRequesterAddr, _pendingSpyAddr,
+             sizeof(_spyRelayRequesterAddr));
+      _spyRelayRequesterPort = _pendingSpyPort;
+      memcpy(_spyRelayTargetAddr, _pendingSpyTargetAddr,
+             sizeof(_spyRelayTargetAddr));
+      _spyRelayTargetPort = _pendingSpyTargetPort;
+      _spyRelayFromWeb = true;
+      _spyRelayActive.store(true);
+      memcpy(_spyTargetAddr, _pendingSpyTargetAddr,
+             sizeof(_spyTargetAddr));
+      _spyTargetPort = _pendingSpyTargetPort;
+    }
+    const bool targetWebPeer =
+        (_pendingSpyTargetFlags & kSpyTargetWebPeer) != 0;
+    sendSpyCommand(command, _pendingSpyTargetAddr,
+                   _pendingSpyTargetPort, targetWebPeer);
+    if (command == kSpyLiveStop) {
+      _spyRelayActive.store(false);
+    }
     return;
   }
 
@@ -1205,7 +1729,7 @@ void IntercomApp::handlePendingSpy() {
 }
 
 void IntercomApp::sendSpyCommand(uint8_t cmd, const uint8_t* addr,
-                                 uint16_t port) {
+                                 uint16_t port, bool webPeer) {
   if (!addr) {
     return;
   }
@@ -1216,7 +1740,7 @@ void IntercomApp::sendSpyCommand(uint8_t cmd, const uint8_t* addr,
   header->magic = kMagic;
   header->version = kVersion;
   header->type = kPacketSpy;
-  header->flags = 0;
+  header->flags = webPeer ? kSpyFlagWebPeerTarget : 0;
   header->seq = 0;
   header->predictor = 0;
   header->adpcmIndex = 0;
@@ -1224,6 +1748,34 @@ void IntercomApp::sendSpyCommand(uint8_t cmd, const uint8_t* addr,
   payload->command = cmd;
 
   sendToPeer(addr, port, buf, sizeof(buf));
+}
+
+bool IntercomApp::routeSpyRelayPacket(const RxPacket& packet) {
+  if (!_spyRelayActive.load()) {
+    return false;
+  }
+
+  bool fromTarget = false;
+  bool sent = false;
+  if (_spyRelayFromWeb) {
+    fromTarget =
+        packet.port == _spyRelayTargetPort &&
+        memcmp(packet.src, _spyRelayTargetAddr,
+               sizeof(_spyRelayTargetAddr)) == 0;
+    if (fromTarget) {
+      sent = _transport.web()->sendTo(
+          _spyRelayRequesterAddr, _spyRelayRequesterPort,
+          packet.data, packet.len);
+    }
+  } else if (packet.port == kWebClientPort) {
+    fromTarget = true;
+    sent = sendToPeer(_spyRelayRequesterAddr, _spyRelayRequesterPort,
+                      packet.data, packet.len);
+  }
+  if (fromTarget && !sent) {
+    Serial.println("[spy] Could not relay spy audio");
+  }
+  return fromTarget;
 }
 
 int IntercomApp::spyTargetIndex() const {

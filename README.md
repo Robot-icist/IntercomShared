@@ -100,3 +100,15 @@ and defines one board flag:
 
 `IntercomConfig.h` uses those flags to select the audio port sharing policy and
 the UI canvas memory type.
+
+## Web intercom
+
+When Wi-Fi is connected, the device serves the web client over HTTPS on port
+443. Open `https://<device-name>-web.local/` (or the device's HTTPS IP address)
+and accept the self-signed certificate in the browser. The certificate and key
+are generated on the device and persisted in NVS; a changed network IP may
+require accepting the renewed certificate. The browser microphone requires
+this trusted secure connection before granting `getUserMedia` access. To limit
+TLS memory use, only one browser WebSocket client can be connected at a time.
+The browser appears as a peer to the device and supports spy audio in either
+direction while the page remains connected.

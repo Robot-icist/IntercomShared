@@ -36,6 +36,12 @@ enum PacketType : uint8_t {
 // Receive-only units (for example the ATOM Lite speaker) set bit 0 so spy
 // mode never tries to record from them.
 constexpr uint8_t kHelloFlagReceiveOnly = 0x01;
+constexpr uint8_t kHelloFlagWebPeer = 0x02;
+constexpr uint8_t kHelloFlagHasDeviceMac = 0x04;
+constexpr uint8_t kAudioFlagWebPeer = 0x01;
+constexpr uint8_t kSpyFlagWebPeerTarget = 0x01;
+constexpr uint8_t kSpyTargetWebPeer = 0x02;
+constexpr uint16_t kWebClientPort = 1000;
 
 enum SpyCommand : uint8_t {
   kSpyLiveStart = 1,
@@ -65,17 +71,32 @@ struct HelloPayload {
   uint8_t mode;
   char name[16];
 };
+
+struct HelloDeviceIdentity {
+  uint8_t mac[6];
+};
 #pragma pack(pop)
 
 #pragma pack(push, 1)
 struct SpyPayload {
   uint8_t command;
 };
+
+struct SpyTargetPayload {
+  uint8_t command;
+  uint8_t addr[6];
+  uint16_t port;
+  uint8_t flags;
+};
 #pragma pack(pop)
 
 static_assert(sizeof(PacketHeader) == 10, "PacketHeader must stay 10 bytes");
 static_assert(sizeof(HelloPayload) == 18, "HelloPayload must stay 18 bytes");
+static_assert(sizeof(HelloDeviceIdentity) == 6,
+              "HelloDeviceIdentity must stay 6 bytes");
 static_assert(sizeof(SpyPayload) == 1, "SpyPayload must stay 1 byte");
+static_assert(sizeof(SpyTargetPayload) == 10,
+              "SpyTargetPayload must stay 10 bytes");
 
 struct RxPacket {
   uint8_t src[6];

@@ -2,17 +2,23 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_https_server.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 
 #include <atomic>
 #include <functional>
+#include <string>
+#include <vector>
 
 #include "IntercomConfig.h"
 #include "IntercomTypes.h"
 
 namespace intercom
 {
+
+  // Forward declarations
+  class TransportManager;
 
   // Transport interface - all transports implement this for unified API
   class Transport
@@ -203,6 +209,119 @@ namespace intercom
     String _savedPass;
   };
 
+  // Web transport using Espressif's HTTPS server and HTTPD WebSocket support.
+  class WebTransport : public Transport
+  {
+  public:
+    WebTransport();
+    ~WebTransport();
+
+    bool begin() override;
+    void end() override;
+
+    bool send(const uint8_t *data, size_t len) override;
+    bool sendTo(const uint8_t *addr, uint16_t port, const uint8_t *data,
+                size_t len) override;
+    bool broadcast(const uint8_t *data, size_t len) override;
+    bool sendHello(const char *name, uint8_t battery, Mode mode) override;
+
+    bool poll() override;
+
+    bool hasPeer() const override;
+    void peerName(char *out, size_t outSize) const override;
+    int8_t peerRssi() const override { return _peerRssi.load(); }
+    uint32_t droppedPackets() const override { return _dropped.load(); }
+
+    bool popPacket(RxPacket &out, uint32_t timeoutMs = 0) override;
+
+    const char *typeName() const override { return "Web"; }
+    bool isLocalNetwork() const override { return true; }
+
+    // Web configuration
+    void setConfigCallback(ConfigCallback cb) override { _configCb = cb; }
+    void setDeviceName(const char *name);
+
+    // TransportManager integration
+    void setTransportManager(TransportManager *mgr);
+
+    // Web client management
+    size_t connectedClients() const;
+    void broadcastToWeb(const uint8_t *data, size_t len);
+    bool audioTarget(uint8_t *addr, uint16_t &port, bool &viaWifi,
+                     bool &webPeer, bool &all) const;
+    bool isRunning() const { return _running.load(); }
+
+  private:
+    static void webServerStartTask(void *arg);
+    bool setupWebServer();
+    void stopWebServer();
+    static esp_err_t handleRoot(httpd_req_t *req);
+    static esp_err_t handleAppJs(httpd_req_t *req);
+    static esp_err_t handleStyleCss(httpd_req_t *req);
+    static esp_err_t handleManifestJson(httpd_req_t *req);
+    static esp_err_t handleWebSocket(httpd_req_t *req);
+    esp_err_t serveFileFromFS(httpd_req_t *req, const char *path,
+                              const char *contentType);
+    esp_err_t handleWebSocketMessage(httpd_req_t *req, int socket,
+                                     httpd_ws_frame_t *frame);
+    bool registerWebClient(int socket, size_t &clientIndex);
+    void queueWebSocketFrame(int socket, const uint8_t *data, size_t len,
+                             httpd_ws_type_t type);
+    static void sendWebSocketWork(void *arg);
+    void queueWebPacket(const uint8_t *src, uint16_t port, int8_t rssi,
+                        const uint8_t *data, int len);
+    void noteWebPeer(const uint8_t *mac, uint16_t port);
+    void sendWebPacket(size_t clientIndex, const uint8_t *data, size_t len);
+    void broadcastWebPacket(const uint8_t *data, size_t len);
+
+    QueueHandle_t _queue = nullptr;
+    SemaphoreHandle_t _peerMutex = nullptr;
+    uint8_t _peerMac[6] = {0};
+    uint16_t _peerPort = 0;
+    uint8_t _audioTargetMac[6] = {0};
+    uint16_t _audioTargetPort = 0;
+    bool _audioTargetViaWifi = false;
+    bool _audioTargetWebPeer = false;
+    bool _audioTargetAll = true;
+    bool _hasPeer = false;
+    uint32_t _lastPeerMs = 0;
+    static constexpr uint32_t kPeerTimeoutMs = 5000;
+    char _peerName[16] = {0};
+    std::atomic<int8_t> _peerRssi{0};
+    std::atomic<uint32_t> _dropped{0};
+    std::atomic<bool> _peerReady{false};
+
+    httpd_handle_t _httpsServer = nullptr;
+    std::string _certificatePem;
+    std::string _privateKeyPem;
+    std::atomic<bool> _running{false};
+    std::atomic<bool> _wifiConnected{false};
+    std::atomic<bool> _serverStartInProgress{false};
+    std::atomic<bool> _ending{false};
+    char _deviceName[32] = {0};
+    ConfigCallback _configCb = nullptr;
+    bool _mdnsStarted = false;
+
+    // Connected web clients (each client is a "peer")
+    struct WebClient {
+      int socket = -1;
+      uint8_t mac[6] = {0};
+      uint16_t port = 0;
+      bool active = false;
+      uint32_t lastSeen = 0;
+      char name[16] = {0};
+    };
+    static constexpr size_t kMaxWebClients = 1;
+    WebClient _webClients[kMaxWebClients];
+    SemaphoreHandle_t _clientMutex = nullptr;
+    uint32_t _lastServerAttemptMs = 0;
+
+    static WebTransport *g_instance;
+
+    // TransportManager pointer for cross-transport communication
+    class TransportManager *_transportManager = nullptr;
+  };
+
   // Transport manager - handles multiple transports, auto-selection, fallback
   class TransportManager
   {
@@ -222,9 +341,10 @@ namespace intercom
     // Get transport by type
     EspNowTransport *espNow() { return &_espNow; }
     WiFiTransport *wifi() { return &_wifi; }
+    WebTransport *web() { return &_web; }
 
     // Transport selection
-    void setPreferredTransport(const char *type); // "espnow", "wifi", "auto"
+    void setPreferredTransport(const char *type); // "espnow", "wifi", "web", "auto"
     const char *currentTransportType() const;
 
     // WiFi configuration
@@ -241,6 +361,7 @@ namespace intercom
 
     EspNowTransport _espNow;
     WiFiTransport _wifi;
+    WebTransport _web;
     Transport *_activeTransport = nullptr;
     String _preferredTransport = "auto";
     TransportChangeCallback _transportChangeCb = nullptr;
@@ -255,18 +376,5 @@ namespace intercom
         // "officepass",
         nullptr};
   };
-
-  // Fallback WiFi credentials (also accessible from WiFiTransport)
-  namespace
-  {
-    constexpr const char *kFallbackSSIDs[] = {
-        // "HOME_WIFI",
-        // "OFFICE_WIFI",
-        nullptr};
-    constexpr const char *kFallbackPasses[] = {
-        // "password123",
-        // "officepass",
-        nullptr};
-  }
 
 } // namespace intercom

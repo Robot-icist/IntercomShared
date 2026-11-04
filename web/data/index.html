@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#1a1a2e">
+  <title>Intercom Web Client</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="manifest" href="manifest.json">
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>Intercom</h1>
+      <div id="status" class="status disconnected">Disconnected</div>
+    </header>
+
+    <main>
+      <div id="peer-info">
+        <div class="peer-name">All peers</div>
+        <div class="peer-rssi">Broadcasting</div>
+      </div>
+
+      <div id="audio-levels">
+        <div class="level-container">
+          <label>Mic input <span id="mic-level-value">0%</span></label>
+          <div class="level-bar"><div class="level-fill mic-level"></div></div>
+          <div id="mic-status" class="mic-status">Waiting for connection</div>
+        </div>
+        <div class="level-container">
+          <label>RX</label>
+          <div class="level-bar"><div class="level-fill rx-level"></div></div>
+        </div>
+      </div>
+      <div id="tx-status" class="tx-status">Offline</div>
+
+      <div id="peer-list" class="peer-list">
+        <h3>Select target</h3>
+        <p class="peer-list-hint">
+          Applies to Live / Clip and Spy. Spy requires selecting one peer.
+        </p>
+        <div id="peer-items"></div>
+      </div>
+
+      <div id="controls">
+        <button id="talk-btn" class="talk-btn">Hold to Talk</button>
+        <button id="clip-btn" class="clip-btn">Record Clip</button>
+        <button id="mute-btn" class="mute-btn">Mute</button>
+      </div>
+
+      <div id="spy-controls" class="spy-controls hidden">
+        <button id="spy-live-btn" class="spy-btn">Spy Live</button>
+        <button id="spy-clip-btn" class="spy-btn">Spy Clip</button>
+        <button id="spy-stop-btn" class="spy-btn stop">Stop Spy</button>
+      </div>
+
+      <div id="settings">
+        <div class="setting">
+          <label>Volume</label>
+          <input type="range" id="volume" min="0" max="100" value="50">
+        </div>
+        <div class="setting">
+          <label>Mode</label>
+          <select id="mode">
+            <option value="live">Live / Clip</option>
+            <option value="spy">Spy</option>
+          </select>
+        </div>
+      </div>
+
+      <div id="log" class="log"></div>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

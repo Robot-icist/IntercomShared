@@ -755,6 +755,13 @@ namespace intercom
       {
         String name = extractJsonString(message.c_str(), "name");
         if (name.length() == 0) name = "WebClient";
+        uint8_t identity[6] = {};
+        const String identityAddress =
+            extractJsonString(message.c_str(), "identityMac");
+        if (!parseMacAddress(identityAddress.c_str(), identity))
+        {
+          makeWebPeerIdentity(name.c_str(), identity);
+        }
         if (_clientMutex &&
             xSemaphoreTake(_clientMutex, pdMS_TO_TICKS(20)) == pdTRUE)
         {
@@ -762,20 +769,29 @@ namespace intercom
                   sizeof(_webClients[clientIndex].name) - 1);
           _webClients[clientIndex].name[
               sizeof(_webClients[clientIndex].name) - 1] = 0;
+          memcpy(_webClients[clientIndex].identity, identity,
+                 sizeof(identity));
           xSemaphoreGive(_clientMutex);
         }
 
-        uint8_t packet[sizeof(PacketHeader) + sizeof(HelloPayload)] = {};
+        uint8_t packet[sizeof(PacketHeader) + sizeof(HelloPayload) +
+                       sizeof(HelloDeviceIdentity)] = {};
         PacketHeader *header = reinterpret_cast<PacketHeader *>(packet);
         HelloPayload *hello =
             reinterpret_cast<HelloPayload *>(packet + sizeof(PacketHeader));
+        HelloDeviceIdentity *deviceIdentity =
+            reinterpret_cast<HelloDeviceIdentity *>(
+                packet + sizeof(PacketHeader) + sizeof(HelloPayload));
         header->magic = kMagic;
         header->version = kVersion;
         header->type = kPacketHello;
-        header->payloadLen = sizeof(HelloPayload);
+        header->flags = kHelloFlagWebPeer | kHelloFlagHasDeviceMac;
+        header->payloadLen =
+            sizeof(HelloPayload) + sizeof(HelloDeviceIdentity);
         hello->battery = 0xFF;
         hello->mode = static_cast<uint8_t>(Mode::Live);
         strncpy(hello->name, name.c_str(), sizeof(hello->name) - 1);
+        memcpy(deviceIdentity->mac, identity, sizeof(identity));
         noteWebPeer(clientMac, clientPort);
         queueWebPacket(clientMac, clientPort, 0, packet, sizeof(packet));
         Serial.printf("[web] Received peer hello from %s (port %u)\n",
@@ -794,6 +810,7 @@ namespace intercom
       {
         const String target = extractJsonString(message.c_str(), "id");
         uint8_t targetMac[6] = {};
+        uint8_t targetIdentity[6] = {};
         uint16_t targetPort = 0;
         uint16_t parsedPort = 0;
         const bool targetWebPeer =
@@ -804,9 +821,13 @@ namespace intercom
         {
           const String targetAddress =
               extractJsonString(message.c_str(), "addr");
+          const String identityAddress =
+              extractJsonString(message.c_str(), "identityMac");
           if (targetAddress.length() > 0 &&
               parseMacAddress(targetAddress.c_str(), targetMac) &&
-              extractJsonUint16(message.c_str(), "port", parsedPort))
+              extractJsonUint16(message.c_str(), "port", parsedPort) &&
+              (!targetWebPeer ||
+               parseMacAddress(identityAddress.c_str(), targetIdentity)))
           {
             targetPort = parsedPort;
             targetValid = true;
@@ -833,6 +854,8 @@ namespace intercom
             {
               memcpy(client.audioTargetMac, targetMac,
                      sizeof(client.audioTargetMac));
+              memcpy(client.audioTargetIdentity, targetIdentity,
+                     sizeof(client.audioTargetIdentity));
               client.audioTargetPort = targetPort;
               client.audioTargetViaWifi =
                   extractJsonBool(message.c_str(), "viaWifi");
@@ -872,6 +895,14 @@ namespace intercom
         target->flags = extractJsonBool(message.c_str(), "webPeer")
                             ? kSpyTargetWebPeer
                             : 0;
+        const String identityAddress =
+            extractJsonString(message.c_str(), "identityMac");
+        if ((target->flags & kSpyTargetWebPeer) != 0 &&
+            !parseMacAddress(identityAddress.c_str(), target->identity))
+        {
+          Serial.println("[web] Ignored spy target without web identity");
+          return ESP_OK;
+        }
         queueWebPacket(clientMac, clientPort, 0, packet, sizeof(packet));
       }
       return ESP_OK;
@@ -1271,6 +1302,56 @@ namespace intercom
     if (data && len) broadcastWebPacket(data, len);
   }
 
+  bool WebTransport::sendToWebPeer(const uint8_t identity[6],
+                                   const uint8_t *data, size_t len)
+  {
+    if (!identity || !data || len == 0 || !_clientMutex ||
+        xSemaphoreTake(_clientMutex, pdMS_TO_TICKS(20)) != pdTRUE)
+    {
+      return false;
+    }
+
+    int socket = -1;
+    for (size_t i = 0; i < kMaxWebClients; ++i)
+    {
+      if (_webClients[i].active &&
+          memcmp(_webClients[i].identity, identity,
+                 sizeof(_webClients[i].identity)) == 0)
+      {
+        socket = _webClients[i].socket;
+        break;
+      }
+    }
+    xSemaphoreGive(_clientMutex);
+    if (socket < 0) return false;
+    queueWebSocketFrame(socket, data, len, HTTPD_WS_TYPE_BINARY);
+    return true;
+  }
+
+  bool WebTransport::webClientIdentity(uint16_t clientPort,
+                                       uint8_t identity[6]) const
+  {
+    if (!identity || !_clientMutex ||
+        xSemaphoreTake(_clientMutex, pdMS_TO_TICKS(10)) != pdTRUE)
+    {
+      return false;
+    }
+
+    bool found = false;
+    for (size_t i = 0; i < kMaxWebClients; ++i)
+    {
+      if (_webClients[i].active && _webClients[i].port == clientPort)
+      {
+        memcpy(identity, _webClients[i].identity,
+               sizeof(_webClients[i].identity));
+        found = true;
+        break;
+      }
+    }
+    xSemaphoreGive(_clientMutex);
+    return found;
+  }
+
   void WebTransport::broadcastToWebExcept(uint16_t excludedPort,
                                           const uint8_t *data, size_t len)
   {
@@ -1279,7 +1360,8 @@ namespace intercom
 
   bool WebTransport::audioTarget(uint16_t clientPort, uint8_t *addr,
                                  uint16_t &port,
-                                 bool &viaWifi, bool &webPeer, bool &all) const
+                                 bool &viaWifi, bool &webPeer,
+                                 uint8_t *identity, bool &all) const
   {
     if (!_clientMutex ||
         xSemaphoreTake(_clientMutex, pdMS_TO_TICKS(10)) != pdTRUE)
@@ -1300,6 +1382,11 @@ namespace intercom
         port = client.audioTargetPort;
         viaWifi = client.audioTargetViaWifi;
         webPeer = client.audioTargetWebPeer;
+        if (identity)
+        {
+          memcpy(identity, client.audioTargetIdentity,
+                 sizeof(client.audioTargetIdentity));
+        }
       }
       break;
     }

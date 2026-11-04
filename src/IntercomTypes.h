@@ -39,6 +39,7 @@ constexpr uint8_t kHelloFlagReceiveOnly = 0x01;
 constexpr uint8_t kHelloFlagWebPeer = 0x02;
 constexpr uint8_t kHelloFlagHasDeviceMac = 0x04;
 constexpr uint8_t kAudioFlagWebPeer = 0x01;
+constexpr uint8_t kAudioFlagWebPeerTarget = 0x02;
 constexpr uint8_t kSpyFlagWebPeerTarget = 0x01;
 constexpr uint8_t kSpyTargetWebPeer = 0x02;
 constexpr uint16_t kWebClientPort = 1000;
@@ -47,6 +48,23 @@ constexpr size_t kMaxWebClients = 3;
 constexpr bool isWebClientPort(uint16_t port) {
   return port >= kWebClientPort &&
          port < kWebClientPort + kMaxWebClients;
+}
+
+inline void makeWebPeerIdentity(const char* name, uint8_t identity[6]) {
+  uint32_t hash = 2166136261u;
+  if (name) {
+    for (const unsigned char* p =
+             reinterpret_cast<const unsigned char*>(name);
+         *p; ++p) {
+      hash = (hash ^ *p) * 16777619u;
+    }
+  }
+  identity[0] = 0x02;
+  identity[1] = 0x57;
+  identity[2] = static_cast<uint8_t>(hash >> 24);
+  identity[3] = static_cast<uint8_t>(hash >> 16);
+  identity[4] = static_cast<uint8_t>(hash >> 8);
+  identity[5] = static_cast<uint8_t>(hash);
 }
 
 enum SpyCommand : uint8_t {
@@ -81,6 +99,10 @@ struct HelloPayload {
 struct HelloDeviceIdentity {
   uint8_t mac[6];
 };
+
+struct WebPeerAudioTarget {
+  uint8_t identity[6];
+};
 #pragma pack(pop)
 
 #pragma pack(push, 1)
@@ -93,6 +115,7 @@ struct SpyTargetPayload {
   uint8_t addr[6];
   uint16_t port;
   uint8_t flags;
+  uint8_t identity[6];
 };
 #pragma pack(pop)
 
@@ -100,9 +123,11 @@ static_assert(sizeof(PacketHeader) == 10, "PacketHeader must stay 10 bytes");
 static_assert(sizeof(HelloPayload) == 18, "HelloPayload must stay 18 bytes");
 static_assert(sizeof(HelloDeviceIdentity) == 6,
               "HelloDeviceIdentity must stay 6 bytes");
+static_assert(sizeof(WebPeerAudioTarget) == 6,
+              "WebPeerAudioTarget must stay 6 bytes");
 static_assert(sizeof(SpyPayload) == 1, "SpyPayload must stay 1 byte");
-static_assert(sizeof(SpyTargetPayload) == 10,
-              "SpyTargetPayload must stay 10 bytes");
+static_assert(sizeof(SpyTargetPayload) == 16,
+              "SpyTargetPayload must stay 16 bytes");
 
 struct RxPacket {
   uint8_t src[6];

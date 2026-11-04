@@ -1,14 +1,6 @@
 // Intercom Web Client
-function loadWebPeerName() {
-  const storageKey = 'intercom-web-peer-name';
-  try {
-    const savedName = sessionStorage.getItem(storageKey);
-    if (/^WebClient-[A-F0-9]{5}$/.test(savedName || '')) return savedName;
-  } catch (e) {
-    console.warn('Could not read the web peer identity from session storage:', e);
-  }
-
-  const randomBytes = new Uint8Array(3);
+function createWebPeerIdentity() {
+  const randomBytes = new Uint8Array(6);
   if (window.crypto && window.crypto.getRandomValues) {
     window.crypto.getRandomValues(randomBytes);
   } else {
@@ -16,19 +8,17 @@ function loadWebPeerName() {
       randomBytes[i] = Math.floor(Math.random() * 256);
     }
   }
-  const suffix = Array.from(randomBytes, byte =>
-    byte.toString(16).padStart(2, '0')).join('').toUpperCase().slice(0, 5);
-  const name = 'WebClient-' + suffix;
-  try {
-    sessionStorage.setItem(storageKey, name);
-  } catch (e) {
-    console.warn('Could not save the web peer identity to session storage:', e);
-  }
-  return name;
+  randomBytes[0] = (randomBytes[0] & 0xFE) | 0x02;
+  return Array.from(randomBytes, byte =>
+    byte.toString(16).padStart(2, '0')).join(':').toUpperCase();
 }
 
+const webPeerIdentity = createWebPeerIdentity();
+const webPeerName = 'Web-' + webPeerIdentity.replace(/:/g, '').slice(-10);
+
 const CONFIG = {
-  webPeerName: loadWebPeerName(),
+  webPeerName,
+  webPeerIdentity,
   wsUrl: (window.location.protocol === 'https:' ? 'wss://' : 'ws://') +
     window.location.host + '/ws',
   reconnectDelay: 2000,
@@ -221,9 +211,16 @@ function updateStatus(state) {
 
 function samePeer(peer, candidate) {
   if (Boolean(peer.webPeer) !== Boolean(candidate.webPeer)) return false;
+  if (peer.webPeer) {
+    if (peer.identityMac && candidate.identityMac) {
+      return peer.identityMac.toUpperCase() === candidate.identityMac.toUpperCase();
+    }
+    return peer.id === candidate.id ||
+      (peer.name && candidate.name && peer.name === candidate.name);
+  }
   return peer.id === candidate.id ||
     (peer.name && candidate.name && peer.name === candidate.name) ||
-    (!peer.webPeer && peer.mac && candidate.mac &&
+    (peer.mac && candidate.mac &&
       peer.mac.toUpperCase() === candidate.mac.toUpperCase());
 }
 
@@ -257,7 +254,11 @@ function normalizePeers(list) {
 }
 
 function sendHello() {
-  sendPacket(JSON.stringify({ cmd: 'hello', name: CONFIG.webPeerName }));
+  sendPacket(JSON.stringify({
+    cmd: 'hello',
+    name: CONFIG.webPeerName,
+    identityMac: CONFIG.webPeerIdentity
+  }));
 }
 
 function sendAudioTarget() {
@@ -266,6 +267,7 @@ function sendAudioTarget() {
     cmd: 'target',
     id: peer ? peer.id : 'all',
     addr: peer ? peer.mac || '' : '',
+    identityMac: peer ? peer.identityMac || '' : '',
     port: peer ? Number(peer.port || 0) : 0,
     viaWifi: peer ? Boolean(peer.viaWifi) : false,
     webPeer: peer ? Boolean(peer.webPeer) : false
@@ -326,6 +328,7 @@ function sendSpyCommand(cmd, peer) {
     action: cmd,
     addr: peer.mac,
     port: Number(peer.port || 0),
+    identityMac: peer.identityMac || '',
     viaWifi: Boolean(peer.viaWifi),
     webPeer: Boolean(peer.webPeer)
   }));
@@ -754,7 +757,11 @@ function handleTextMessage(data) {
     } else if (msg.type === 'peer_list') {
       // Full peer list update
       const previousSelection = selectedPeer;
-      peers = normalizePeers(Array.isArray(msg.peers) ? msg.peers : []);
+      peers = normalizePeers(Array.isArray(msg.peers) ? msg.peers : [])
+        .filter(peer => !peer.webPeer ||
+          (peer.identityMac
+            ? peer.identityMac.toUpperCase() !== CONFIG.webPeerIdentity
+            : peer.name !== CONFIG.webPeerName));
       if (selectedPeer) {
         selectedPeer = peers.find(peer => samePeer(peer, previousSelection)) || null;
       }

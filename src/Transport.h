@@ -247,8 +247,11 @@ namespace intercom
     // Web client management
     size_t connectedClients() const;
     void broadcastToWeb(const uint8_t *data, size_t len);
+    bool sendToWebPeer(const uint8_t identity[6], const uint8_t *data,
+                       size_t len);
+    bool webClientIdentity(uint16_t clientPort, uint8_t identity[6]) const;
     bool audioTarget(uint16_t clientPort, uint8_t *addr, uint16_t &port, bool &viaWifi,
-                     bool &webPeer, bool &all) const;
+                     bool &webPeer, uint8_t *identity, bool &all) const;
     bool isRunning() const { return _running.load(); }
     void broadcastToWebExcept(uint16_t excludedPort, const uint8_t *data,
                               size_t len);
@@ -314,7 +317,9 @@ namespace intercom
       bool active = false;
       uint32_t lastSeen = 0;
       char name[16] = {0};
+      uint8_t identity[6] = {0};
       uint8_t audioTargetMac[6] = {0};
+      uint8_t audioTargetIdentity[6] = {0};
       uint16_t audioTargetPort = 0;
       bool audioTargetViaWifi = false;
       bool audioTargetWebPeer = false;

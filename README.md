@@ -110,5 +110,7 @@ are generated on the device and persisted in NVS; a changed network IP may
 require accepting the renewed certificate. The browser microphone requires
 this trusted secure connection before granting `getUserMedia` access. Up to
 three browser WebSocket clients can connect at once; each appears as a peer
-with its own audio target. The browser supports spy audio in either direction
-while the page remains connected.
+with its own identity and selectable audio/spy target. Browser peers are
+announced to other web clients and ESP units, and unicast audio is routed
+through the connected ESP to the selected browser only. The browser supports
+spy audio in either direction while the page remains connected.

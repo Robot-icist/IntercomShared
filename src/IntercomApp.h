@@ -46,6 +46,7 @@ class IntercomApp {
 
   struct Target {
     uint8_t addr[6] = {0};
+    uint8_t identity[6] = {0};
     uint16_t port = 0;
     bool viaWifi = false;
     bool webPeer = false;
@@ -98,7 +99,8 @@ class IntercomApp {
   void handleSpyPacket(const RxPacket& packet);
   void handlePendingSpy();
   void sendSpyCommand(uint8_t cmd, const uint8_t* addr, uint16_t port,
-                      bool webPeer = false);
+                      bool webPeer = false,
+                      const uint8_t* webPeerIdentity = nullptr);
   bool routeSpyRelayPacket(const RxPacket& packet);
   int spyTargetIndex() const;
   bool acceptAudio(const uint8_t* src, uint16_t port) const;
@@ -141,6 +143,7 @@ class IntercomApp {
   std::atomic<bool> _spyRequestClip{false};
   std::atomic<bool> _spyAwaitClip{false};
   uint8_t _spyTargetAddr[6] = {0};
+  uint8_t _spyTargetIdentity[6] = {0};
   uint16_t _spyTargetPort = 0;
   bool _spyTargetWebPeer = false;
   uint32_t _spyRequestUntilMs = 0;
@@ -157,6 +160,7 @@ class IntercomApp {
   uint16_t _pendingSpyPort = 0;
   bool _pendingSpyFromWeb = false;
   uint8_t _pendingSpyTargetAddr[6] = {0};
+  uint8_t _pendingSpyTargetIdentity[6] = {0};
   uint16_t _pendingSpyTargetPort = 0;
   uint8_t _pendingSpyTargetFlags = 0;
   std::atomic<bool> _spyRelayActive{false};
@@ -164,6 +168,7 @@ class IntercomApp {
   uint8_t _spyRelayRequesterAddr[6] = {0};
   uint16_t _spyRelayRequesterPort = 0;
   uint8_t _spyRelayTargetAddr[6] = {0};
+  uint8_t _spyRelayTargetIdentity[6] = {0};
   uint16_t _spyRelayTargetPort = 0;
 
   // Clip send destination snapshot.

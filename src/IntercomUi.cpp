@@ -56,6 +56,8 @@ namespace intercom
     _canvas.setColorDepth(16);
     _canvas.setPsram(kUiUsePsram);
     _useCanvas = _canvas.createSprite(_w, _h) != nullptr;
+    _lastHeaderPhaseMs = millis();
+    _lastHeaderScrollMs = _lastHeaderPhaseMs;
     if (!_useCanvas)
     {
       Serial.println("[ui] sprite allocation failed, drawing directly");
@@ -92,56 +94,67 @@ namespace intercom
   void IntercomUi::drawHeader(lgfx::LGFXBase &g, const UiState &s)
   {
     const uint32_t now = millis();
-    const bool hasNetworkIdentity =
-        s.selfAddress[0] != 0 && s.selfMdns[0] != 0;
-    if (!hasNetworkIdentity)
+    const char *identityLabel = s.selfName[0] ? s.selfName : INTERCOM_DEVICE_NAME;
+    switch (_headerPhase)
     {
-      _headerPhase = 0;
-      _headerScrollOffset = 0;
-      _lastHeaderPhaseMs = now;
-      _lastHeaderScrollMs = now;
-    }
-    else if (_headerPhase < 2 && now - _lastHeaderPhaseMs >= 2000)
-    {
-      ++_headerPhase;
-      _lastHeaderPhaseMs = now;
-      _headerScrollOffset = 0;
+    case 1:
+      identityLabel = s.selfAddress[0] ? s.selfAddress : "WIFI WAIT";
+      break;
+    case 2:
+      identityLabel = s.selfMdns[0] ? s.selfMdns : "NO MDNS";
+      break;
+    case 3:
+      identityLabel = s.selfOtaPassword[0] ? s.selfOtaPassword : "OTA OFF";
+      break;
+    default:
+      break;
     }
 
-    char identity[32] = {0};
-    const char *identityLabel =
-        s.selfName[0] ? s.selfName : INTERCOM_DEVICE_NAME;
-    if (hasNetworkIdentity && _headerPhase == 1)
+    const size_t maxCharacters =
+        (size_t)std::max(1, std::min(63, (_w - 38) / 6));
+    size_t identityLength = strlen(identityLabel);
+    const size_t maxOffset =
+        identityLength > maxCharacters ? identityLength - maxCharacters : 0;
+    const uint32_t phaseDurationMs = std::max<uint32_t>(
+        _headerPhase == 3 ? 10000U : 2000U,
+        2000U + (uint32_t)maxOffset * 350U);
+    if (now - _lastHeaderPhaseMs >= phaseDurationMs)
     {
-      identityLabel = s.selfAddress;
+      _headerPhase = (_headerPhase + 1) % 4;
+      _lastHeaderPhaseMs = now;
+      _headerScrollOffset = 0;
+      _lastHeaderScrollMs = now;
+      identityLabel = _headerPhase == 1
+                          ? (s.selfAddress[0] ? s.selfAddress : "WIFI WAIT")
+                      : _headerPhase == 2
+                          ? (s.selfMdns[0] ? s.selfMdns : "NO MDNS")
+                      : _headerPhase == 3
+                          ? (s.selfOtaPassword[0] ? s.selfOtaPassword : "OTA OFF")
+                          : (s.selfName[0] ? s.selfName : INTERCOM_DEVICE_NAME);
     }
-    else if (hasNetworkIdentity && _headerPhase == 2)
+
+    identityLength = strlen(identityLabel);
+    const size_t currentMaxOffset =
+        identityLength > maxCharacters ? identityLength - maxCharacters : 0;
+    if (_headerScrollOffset > currentMaxOffset)
     {
-      const size_t maxCharacters = (size_t)std::max(
-          1, std::min((int)sizeof(identity) - 1, (_w - 38) / 6));
-      const size_t mdnsLength = strlen(s.selfMdns);
-      const size_t maxOffset =
-          mdnsLength > maxCharacters ? mdnsLength - maxCharacters : 0;
-      if (now - _lastHeaderScrollMs >= 500)
-      {
-        ++_headerScrollOffset;
-        _lastHeaderScrollMs = now;
-      }
-      if (_headerScrollOffset > maxOffset)
-      {
-        _headerPhase = 0;
-        _lastHeaderPhaseMs = now;
-        _headerScrollOffset = 0;
-      }
-      const size_t shown = std::min(maxCharacters, mdnsLength - _headerScrollOffset);
-      memcpy(identity, s.selfMdns + _headerScrollOffset, shown);
-      identityLabel = identity;
+      _headerScrollOffset = 0;
     }
+    if (_headerScrollOffset < currentMaxOffset &&
+        now - _lastHeaderScrollMs >= 350)
+    {
+      ++_headerScrollOffset;
+      _lastHeaderScrollMs = now;
+    }
+    char identity[64] = {0};
+    const size_t shown =
+        std::min(maxCharacters, identityLength - _headerScrollOffset);
+    memcpy(identity, identityLabel + _headerScrollOffset, shown);
 
     g.setTextSize(1);
     g.setTextDatum(lgfx::textdatum_t::top_left);
     g.setTextColor(TFT_LIGHTGREY);
-    g.drawString(identityLabel, 4, 2);
+    g.drawString(identity, 4, 2);
 
     char battery[12];
     if (s.battery < 0)

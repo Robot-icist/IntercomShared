@@ -35,7 +35,7 @@ bool EspNowLink::begin() {
 
   esp_now_peer_info_t peer = {};
   memcpy(peer.peer_addr, kBroadcast, sizeof(kBroadcast));
-  peer.channel = kChannel;
+  peer.channel = 0;
   peer.ifidx = WIFI_IF_STA;
   peer.encrypt = false;
   if (esp_now_add_peer(&peer) != ESP_OK) {
@@ -250,7 +250,7 @@ bool EspNowLink::poll() {
 
   esp_now_peer_info_t peer = {};
   memcpy(peer.peer_addr, mac, sizeof(mac));
-  peer.channel = kChannel;
+  peer.channel = 0;
   peer.ifidx = WIFI_IF_STA;
   peer.encrypt = false;
 

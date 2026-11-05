@@ -42,7 +42,7 @@ namespace intercom
 
     esp_now_peer_info_t peer = {};
     memcpy(peer.peer_addr, kBroadcast, sizeof(kBroadcast));
-    peer.channel = kChannel;
+    peer.channel = 0;
     peer.ifidx = WIFI_IF_STA;
     peer.encrypt = false;
     if (esp_now_add_peer(&peer) != ESP_OK)
@@ -116,7 +116,7 @@ namespace intercom
     {
       esp_now_peer_info_t peer = {};
       memcpy(peer.peer_addr, addr, 6);
-      peer.channel = kChannel;
+      peer.channel = 0;
       peer.ifidx = WIFI_IF_STA;
       peer.encrypt = false;
       esp_err_t err = esp_now_add_peer(&peer);
@@ -209,7 +209,7 @@ namespace intercom
 
     esp_now_peer_info_t peer = {};
     memcpy(peer.peer_addr, mac, sizeof(mac));
-    peer.channel = kChannel;
+    peer.channel = 0;
     peer.ifidx = WIFI_IF_STA;
     peer.encrypt = false;
 

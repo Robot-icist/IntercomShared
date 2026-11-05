@@ -133,7 +133,6 @@ bool IntercomApp::begin() {
     Serial.println("[app] clip buffer allocation failed");
     return false;
   }
-
   _battery.store(readBattery());
   _lastBatteryMs = millis();
   _lastHelloMs = millis();
@@ -649,6 +648,8 @@ void IntercomApp::updateUi() {
              localIp[0], localIp[1], localIp[2], localIp[3]);
     snprintf(s.selfMdns, sizeof(s.selfMdns), "%s-web.local", _deviceName);
   }
+  strncpy(s.selfOtaPassword, _transport.otaPassword().c_str(),
+          sizeof(s.selfOtaPassword) - 1);
   s.transportType = t ? t->typeName() : "none";
   fillPeerUi(s);
   s.battery = _battery.load();

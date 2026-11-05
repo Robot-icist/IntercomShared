@@ -53,7 +53,7 @@ namespace intercom
 
     // Transport type identification
     virtual const char *typeName() const = 0;
-    virtual bool isLocalNetwork() const = 0; // WiFi/BLE vs ESP-NOW
+    virtual bool isLocalNetwork() const = 0; // WiFi vs ESP-NOW
 
     // Configuration callbacks
     using ConfigCallback = std::function<void(const char *ssid, const char *pass)>;
@@ -363,6 +363,7 @@ namespace intercom
     // WiFi configuration
     void startWiFiConfig();
     bool isWiFiConfigured() const;
+    const String& otaPassword() const { return _otaPassword; }
 
     // Callbacks
     using TransportChangeCallback = std::function<void(const char *type)>;
@@ -378,6 +379,10 @@ namespace intercom
     Transport *_activeTransport = nullptr;
     String _preferredTransport = "auto";
     TransportChangeCallback _transportChangeCb = nullptr;
+    char _deviceName[32] = {0};
+    String _otaPassword;
+    bool _otaPasswordReady = false;
+    bool _otaStarted = false;
 
     // Hardcoded WiFi credentials fallback (compile-time)
     static constexpr const char *kFallbackSSIDs[] = {

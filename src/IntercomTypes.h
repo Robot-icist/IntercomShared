@@ -161,6 +161,7 @@ struct UiState {
   uint8_t selectedCount = 0;
   char selfAddress[16] = {0};
   char selfMdns[32] = {0};
+  char selfOtaPassword[64] = {0};
   bool spy = false;       // spy activity on either side
   bool spyLive = false;   // live spy stream active
   bool spyClip = false;   // remote clip recording in progress

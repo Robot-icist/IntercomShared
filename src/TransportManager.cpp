@@ -1,7 +1,61 @@
 #include "Transport.h"
 
+#include <ArduinoOTA.h>
+#include <Preferences.h>
+#include <WiFi.h>
+#include <esp_system.h>
+
 namespace intercom
 {
+  namespace
+  {
+    bool configureOtaPassword(const char *deviceName, String &otaPassword)
+    {
+      Preferences preferences;
+      if (!preferences.begin("intercom", false))
+      {
+        Serial.println("[ota] Could not open NVS; authenticated OTA disabled");
+        return false;
+      }
+
+      String password = preferences.getString("ota_pass", "");
+      bool generated = false;
+      if (password.length() == 0)
+      {
+        static constexpr char kHex[] = "0123456789ABCDEF";
+        char generatedPassword[25] = {};
+        for (size_t i = 0; i < sizeof(generatedPassword) - 1; ++i)
+        {
+          generatedPassword[i] = kHex[esp_random() & 0x0F];
+        }
+        if (preferences.putString("ota_pass", generatedPassword) == 0)
+        {
+          preferences.end();
+          Serial.println("[ota] Could not save OTA password; OTA disabled");
+          return false;
+        }
+        password = generatedPassword;
+        generated = true;
+      }
+      preferences.end();
+
+      if (password.length() < 8)
+      {
+        Serial.println("[ota] Stored OTA password is too short; OTA disabled");
+        return false;
+      }
+
+      otaPassword = password;
+      ArduinoOTA.setPassword(password.c_str());
+      if (generated)
+      {
+        Serial.printf("[ota] New per-device OTA password for %s: %s (save it now)\n",
+                      deviceName, password.c_str());
+      }
+      return true;
+    }
+  } // namespace
+
   // Hardcoded WiFi credentials fallback (compile-time)
   namespace
   {
@@ -21,6 +75,20 @@ namespace intercom
 
   bool TransportManager::begin(const char *deviceName)
   {
+    if (deviceName)
+    {
+      strncpy(_deviceName, deviceName, sizeof(_deviceName) - 1);
+      _deviceName[sizeof(_deviceName) - 1] = 0;
+    }
+    _otaPasswordReady = configureOtaPassword(_deviceName, _otaPassword);
+    ArduinoOTA.setMdnsEnabled(false);
+    ArduinoOTA.onStart([]()
+                       { Serial.println("[ota] Update started"); });
+    ArduinoOTA.onEnd([]()
+                     { Serial.println("\n[ota] Update complete; restarting"); });
+    ArduinoOTA.onError([](ota_error_t error)
+                       { Serial.printf("[ota] Update failed (%u)\n", error); });
+
     // Set hostname for WiFi
     _wifi.setHostname(deviceName);
     _espNow.setPeerName(deviceName);
@@ -55,6 +123,27 @@ namespace intercom
     _espNow.poll();
     _wifi.poll();
     _web.poll();
+
+    if (_otaPasswordReady)
+    {
+      if (WiFi.isConnected())
+      {
+        if (!_otaStarted)
+        {
+          ArduinoOTA.setHostname(_deviceName);
+          ArduinoOTA.begin();
+          _otaStarted = true;
+          Serial.printf("[ota] Ready at %s.local (%s), firmware and LittleFS OTA enabled\n",
+                        _deviceName, WiFi.localIP().toString().c_str());
+        }
+        ArduinoOTA.handle();
+      }
+      else if (_otaStarted)
+      {
+        ArduinoOTA.end();
+        _otaStarted = false;
+      }
+    }
 
     // Debug: print WiFi status periodically
     if (now - lastTransportDebug > 30000)

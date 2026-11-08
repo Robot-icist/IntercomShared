@@ -41,6 +41,12 @@ bool AudioEngine::begin() {
   M5.Speaker.config(spk);
   M5.Speaker.setVolume(_volume);
 
+  // M5.begin() configures the speaker but does not start it. Explicitly clear
+  // the StickS3 AW8737 PA enable bit anyway: an amplifier left enabled with an
+  // idle ES8311 DAC is the source of the constant hiss heard before any audio
+  // is played. The PA stays off until ensureSpeaker() has real audio to play.
+  M5.Speaker.end();
+
   // The speaker is started from ensureSpeaker() on the application task, once
   // the UI is up. Starting it here or, worse, from the playback task, runs the
   // codec/PMIC I2C setup outside the task that owns M5.update() and the
@@ -71,6 +77,13 @@ bool AudioEngine::startCapture() {
   // microphone while the speaker is live corrupts the codec clocking.
   if (_speakerRunning.load()) {
     stopSpeaker();
+  } else {
+    // Also clear the StickS3 M5PM1 speaker/PA enable bit when M5Unified thinks
+    // the speaker was never started. That bit can survive a failed start or a
+    // previous boot, and the enabled AW8737 then injects hiss while the shared
+    // ES8311 codec captures. M5Stack requires the amplifier to be off before
+    // M5.Mic.begin().
+    M5.Speaker.end();
   }
 
   bool ok = M5.Mic.begin();

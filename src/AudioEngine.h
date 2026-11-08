@@ -11,10 +11,13 @@ namespace intercom {
 
 // Small wrapper around M5Unified's Mic and Speaker classes.
 //
-// It handles the AtomS3R half-duplex turnaround (one I2S peripheral is shared)
-// and keeps the StickS3 speaker running while its separate microphone port is
-// capturing. Playback buffers are returned to us by M5Unified's release
-// callback, so streaming can reuse a fixed pool safely.
+// Both boards are half-duplex: capture and playback must never run together
+// (the AtomS3R shares one I2S peripheral, and the StickS3 mic/speaker share the
+// ES8311 codec and clock pins). Capture always disables the speaker amplifier,
+// including when M5Unified believes the speaker was never started, so the
+// shared codec cannot hiss into the microphone path. Playback buffers are
+// returned to us by M5Unified's release callback, so streaming can reuse a
+// fixed pool safely.
 class AudioEngine {
  public:
   bool begin();

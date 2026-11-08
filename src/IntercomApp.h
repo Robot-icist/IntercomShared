@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <M5Unified.h>
 
 #include <atomic>
 
@@ -61,6 +62,7 @@ class IntercomApp {
   void runPlay();
 
   void handleButtons();
+  bool readJoystickButton(bool& present, bool& pressed);
   bool startLiveTx(bool spy = false);
   void stopLiveTx();
   bool startClipRecord(bool spy = false);
@@ -108,6 +110,7 @@ class IntercomApp {
   AudioEngine _audio;
   TransportManager _transport;
   IntercomUi _ui;
+  m5::Button_Class _primaryButton{};
   SampleRing _jitter;
   SampleRing _clip;
   AdpcmCodec _encoder;

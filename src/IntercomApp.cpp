@@ -64,6 +64,9 @@ bool IntercomApp::begin() {
   }
 
   auto cfg = M5.config();
+  // Enable the external I2C bus (Grove/port A) so optional units such as the
+  // M5Stack Unit Joystick2 can be probed and polled at runtime.
+  cfg.external_imu = true;
 #if defined(INTERCOM_BOARD_ATOMS3R)
   cfg.internal_mic = true;
   cfg.internal_spk = false;
@@ -213,8 +216,36 @@ void IntercomApp::loop() {
   delay(5);
 }
 
+namespace
+{
+constexpr uint8_t kJoystickAddress = 0x63;
+constexpr uint8_t kJoystickButtonRegister = 0x20;
+constexpr uint32_t kI2cFrequency = 400000;
+}  // namespace
+
+bool IntercomApp::readJoystickButton(bool& present, bool& pressed) {
+  present = false;
+  pressed = false;
+  uint8_t value = 1;
+  if (!M5.Ex_I2C.readRegister(kJoystickAddress, kJoystickButtonRegister, &value,
+                              sizeof(value), kI2cFrequency)) {
+    return false;
+  }
+  present = true;
+  pressed = (value == 0);
+  return true;
+}
+
 void IntercomApp::handleButtons() {
-  if (M5.BtnA.wasDoubleClicked()) {
+  bool joystickPresent = false;
+  bool joystickPressed = false;
+  (void)readJoystickButton(joystickPresent, joystickPressed);
+
+  bool hwPressed = M5.BtnA.isPressed();
+  bool combinedPressed = hwPressed || (joystickPresent && joystickPressed);
+  _primaryButton.setRawState(millis(), combinedPressed);
+
+  if (_primaryButton.wasDoubleClicked()) {
     if (_recording.load()) {
       cancelClipRecord();
     } else {
@@ -236,22 +267,22 @@ void IntercomApp::handleButtons() {
 
   if (mode == Mode::Volume) {
     // One-button AtomS3R: click up, hold down. The StickS3 also has BtnB.
-    if (M5.BtnA.wasSingleClicked()) {
+    if (_primaryButton.wasSingleClicked()) {
       changeVolume((int)kVolumeStepPercent);
     }
-    if (M5.BtnA.wasHold()) {
+    if (_primaryButton.wasHold()) {
       changeVolume(-(int)kVolumeStepPercent);
     }
     return;
   }
 
   if (mode == Mode::Live) {
-    if (M5.BtnA.wasPressed()) {
+    if (_primaryButton.wasPressed()) {
       if (!_txActive.load() && !_recording.load() && !_sendingClip.load()) {
         startLiveTx();
       }
     }
-    if (M5.BtnA.wasReleased()) {
+    if (_primaryButton.wasReleased()) {
       // Do not let a local tap stop a remote spy stream.
       if (_txActive.load() && !_spyServeLive.load()) {
         stopLiveTx();
@@ -261,7 +292,7 @@ void IntercomApp::handleButtons() {
   }
 
   if (mode == Mode::Clip) {
-    if (M5.BtnA.wasSingleClicked()) {
+    if (_primaryButton.wasSingleClicked()) {
       if (_recording.load()) {
         stopClipRecordAndSend();
       } else if (!_sendingClip.load()) {
@@ -272,17 +303,17 @@ void IntercomApp::handleButtons() {
   }
 
   if (mode == Mode::Peer) {
-    if (M5.BtnA.wasSingleClicked()) {
+    if (_primaryButton.wasSingleClicked()) {
       peerToggleCurrent();
     }
-    if (M5.BtnA.wasHold()) {
+    if (_primaryButton.wasHold()) {
       peerCycleNext();
     }
     return;
   }
 
   // Spy mode: hold to listen live, click to record a clip on the peer.
-  if (M5.BtnA.wasHold()) {
+  if (_primaryButton.wasHold()) {
     if (!_spyRequestLive.load() && !_spyRequestClip.load() &&
         !_spyAwaitClip.load()) {
       int index = spyTargetIndex();
@@ -304,7 +335,7 @@ void IntercomApp::handleButtons() {
     }
   }
 
-  if (M5.BtnA.wasReleased()) {
+  if (_primaryButton.wasReleased()) {
     if (_spyRequestLive.load()) {
       sendSpyCommand(kSpyLiveStop, _spyTargetAddr, _spyTargetPort,
                      _spyTargetWebPeer, _spyTargetIdentity);
@@ -312,7 +343,7 @@ void IntercomApp::handleButtons() {
     }
   }
 
-  if (M5.BtnA.wasSingleClicked()) {
+  if (_primaryButton.wasSingleClicked()) {
     if (_spyRequestClip.load()) {
       sendSpyCommand(kSpyClipStop, _spyTargetAddr, _spyTargetPort,
                      _spyTargetWebPeer, _spyTargetIdentity);

@@ -95,12 +95,34 @@ namespace intercom
       }
     }
 
+    void setDeviceName(const char *name)
+    {
+      if (name)
+      {
+        strncpy(_deviceName, name, sizeof(_deviceName) - 1);
+        _deviceName[sizeof(_deviceName) - 1] = 0;
+      }
+    }
+
+    // Enable/disable ESP-NOW (for coexistence with WiFi)
+    void setEnabled(bool enabled)
+    {
+      _enabled = enabled;
+    }
+    bool isEnabled() const { return _enabled; }
+
+    // Ensure ESP-NOW stays on fixed channel after WiFi state changes
+    void ensureChannel();
+
   private:
     static void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len);
     void handlePacket(const uint8_t *src, int8_t rssi, const uint8_t *data, int len);
     void queuePacket(const uint8_t *src, int8_t rssi, const uint8_t *data, int len);
     void notePeer(const uint8_t *mac);
     void updatePeerName(const char *name);
+
+    // Discovery
+    void sendDiscovery();
 
     QueueHandle_t _queue = nullptr;
     SemaphoreHandle_t _peerMutex = nullptr;
@@ -109,13 +131,17 @@ namespace intercom
     bool _hasPeer = false;
     bool _pendingPeer = false;
     uint32_t _lastPeerAddMs = 0;
+    uint32_t _lastDiscoveryMs = 0;
+    static constexpr uint32_t kDiscoveryIntervalMs = 2000;
     char _peerName[16] = {0};
+    char _deviceName[16] = {0};
     std::atomic<bool> _peerReady{false};
     std::atomic<uint32_t> _lastPeerMs{0};
     std::atomic<int8_t> _peerRssi{0};
     std::atomic<uint32_t> _dropped{0};
 
     static EspNowTransport *g_instance;
+    bool _enabled = true;
   };
 
   // Fix String comparison warning
@@ -157,6 +183,9 @@ namespace intercom
     void setHostname(const char *name);
     bool isWiFiConfigured() const;
 
+    // ESP-NOW peer coordination (called by TransportManager)
+    void notifyEspNowPeerStatus(bool hasPeer);
+
     // mDNS service discovery
     void startMDNS(const char *hostname);
     void stopMDNS();
@@ -192,8 +221,11 @@ namespace intercom
     static constexpr uint16_t kIntercomPort = 42424;
     static constexpr uint32_t kDiscoveryIntervalMs = 2000;
     static constexpr uint32_t kPeerTimeoutMs = 5000;
+    static constexpr uint32_t kConfigPortalDelayMs = 60000; // 60 seconds delay before AP mode
     uint32_t _lastDiscoveryMs = 0;
     uint32_t _lastHelloMs = 0;
+    uint32_t _configPortalStartMs = 0;
+    bool _configPortalDelayActive = false;
 
     bool _wifiConnected = false;
     bool _mdnsStarted = false;
@@ -383,6 +415,8 @@ namespace intercom
     String _otaPassword;
     bool _otaPasswordReady = false;
     bool _otaStarted = false;
+    bool _webInitialized = false;
+    bool _wifiWasConnected = false;
 
     // Hardcoded WiFi credentials fallback (compile-time)
     static constexpr const char *kFallbackSSIDs[] = {

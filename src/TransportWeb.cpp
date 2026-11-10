@@ -1241,6 +1241,10 @@ namespace intercom
 
   bool WebTransport::hasPeer() const
   {
+    if (!_wifiConnected)
+    {
+      return false;
+    }
     if (_clientMutex &&
         xSemaphoreTake(_clientMutex, pdMS_TO_TICKS(10)) == pdTRUE)
     {

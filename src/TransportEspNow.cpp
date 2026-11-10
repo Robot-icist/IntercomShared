@@ -24,6 +24,10 @@ namespace intercom
       return false;
     }
 
+    _enabled = true;
+
+    // ESP-NOW requires WiFi to be in STA mode. Force STA mode here.
+    // The WiFi transport will re-configure WiFi mode as needed (e.g., AP for config portal).
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
     WiFi.setSleep(false);
@@ -35,6 +39,7 @@ namespace intercom
       return false;
     }
 
+    // Ensure channel is set after init
     esp_wifi_set_channel(kChannel, WIFI_SECOND_CHAN_NONE);
 
     g_instance = this;
@@ -42,7 +47,7 @@ namespace intercom
 
     esp_now_peer_info_t peer = {};
     memcpy(peer.peer_addr, kBroadcast, sizeof(kBroadcast));
-    peer.channel = 0;
+    peer.channel = kChannel;  // Use fixed channel, not 0 (which follows WiFi)
     peer.ifidx = WIFI_IF_STA;
     peer.encrypt = false;
     if (esp_now_add_peer(&peer) != ESP_OK)
@@ -51,7 +56,7 @@ namespace intercom
       return false;
     }
 
-    Serial.printf("[espnow] channel %u, MAC %s\n", (unsigned)kChannel,
+    Serial.printf("[espnow] channel %u (fixed), MAC %s\n", (unsigned)kChannel,
                   WiFi.macAddress().c_str());
     return true;
   }
@@ -75,8 +80,16 @@ namespace intercom
     }
   }
 
+  // Ensure ESP-NOW is on the fixed channel (call after WiFi state changes)
+  void EspNowTransport::ensureChannel()
+  {
+    if (!_enabled) return;
+    esp_wifi_set_channel(kChannel, WIFI_SECOND_CHAN_NONE);
+  }
+
   bool EspNowTransport::send(const uint8_t *data, size_t len)
   {
+    if (!_enabled) return false;
     if (!data || len == 0 || len > kMaxPacketSize)
     {
       return false;
@@ -107,6 +120,7 @@ namespace intercom
   bool EspNowTransport::sendTo(const uint8_t *addr, uint16_t port,
                                const uint8_t *data, size_t len)
   {
+    if (!_enabled) return false;
     (void)port;
     if (!addr || !data || len == 0 || len > kMaxPacketSize)
     {
@@ -116,7 +130,7 @@ namespace intercom
     {
       esp_now_peer_info_t peer = {};
       memcpy(peer.peer_addr, addr, 6);
-      peer.channel = 0;
+      peer.channel = kChannel;  // Use fixed channel
       peer.ifidx = WIFI_IF_STA;
       peer.encrypt = false;
       esp_err_t err = esp_now_add_peer(&peer);
@@ -131,6 +145,7 @@ namespace intercom
 
   bool EspNowTransport::broadcast(const uint8_t *data, size_t len)
   {
+    if (!_enabled) return false;
     if (!data || len == 0 || len > kMaxPacketSize)
     {
       return false;
@@ -140,6 +155,7 @@ namespace intercom
 
   bool EspNowTransport::sendHello(const char *name, uint8_t battery, Mode mode)
   {
+    if (!_enabled) return false;
     alignas(4) uint8_t buf[sizeof(PacketHeader) + sizeof(HelloPayload) +
                            sizeof(HelloDeviceIdentity)] = {};
     PacketHeader *header = (PacketHeader *)buf;
@@ -171,9 +187,29 @@ namespace intercom
 
   bool EspNowTransport::poll()
   {
+    if (!_enabled) return false;
     if (!_peerMutex)
     {
       return false;
+    }
+
+    // Ensure ESP-NOW is on fixed channel (WiFi may have changed mode)
+    ensureChannel();
+
+    // Send periodic discovery if no peer connected
+    uint32_t now = millis();
+    bool hasPeer = false;
+    if (xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) == pdTRUE)
+    {
+      hasPeer = _hasPeer && _peerReady.load() &&
+                (now - _lastPeerMs.load() < kPeerTimeoutMs);
+      xSemaphoreGive(_peerMutex);
+    }
+
+    if (!hasPeer && (now - _lastDiscoveryMs >= kDiscoveryIntervalMs))
+    {
+      _lastDiscoveryMs = now;
+      sendDiscovery();
     }
 
     uint8_t mac[6];
@@ -195,7 +231,6 @@ namespace intercom
       return false;
     }
 
-    const uint32_t now = millis();
     if (_lastPeerAddMs != 0 &&
         (uint32_t)(now - _lastPeerAddMs) < kPeerAddRetryMs)
     {
@@ -209,7 +244,7 @@ namespace intercom
 
     esp_now_peer_info_t peer = {};
     memcpy(peer.peer_addr, mac, sizeof(mac));
-    peer.channel = 0;
+    peer.channel = kChannel;  // Use fixed channel
     peer.ifidx = WIFI_IF_STA;
     peer.encrypt = false;
 
@@ -218,6 +253,7 @@ namespace intercom
     {
       _peerReady.store(true);
       _lastPeerAddMs = 0;
+      _lastPeerMs.store(now);  // Critical: update last peer time so hasPeer() works
       return true;
     }
 
@@ -232,8 +268,39 @@ namespace intercom
     return false;
   }
 
+  void EspNowTransport::sendDiscovery()
+  {
+    if (!_enabled) return;
+
+    // Send a hello packet with discovery flag
+    alignas(4) uint8_t buf[sizeof(PacketHeader) + sizeof(HelloPayload)] = {};
+    PacketHeader *header = (PacketHeader *)buf;
+    HelloPayload *payload = (HelloPayload *)(buf + sizeof(PacketHeader));
+
+    header->magic = kMagic;
+    header->version = kVersion;
+    header->type = kPacketHello;
+    header->flags = 0x80; // Discovery flag
+    header->seq = 0;
+    header->predictor = 0;
+    header->adpcmIndex = 0;
+    header->payloadLen = sizeof(HelloPayload);
+
+    payload->battery = 0xFF;
+    payload->mode = (uint8_t)Mode::Live;
+    memset(payload->name, 0, sizeof(payload->name));
+    // Use device name if set
+    if (_deviceName[0])
+    {
+      strncpy(payload->name, _deviceName, sizeof(payload->name) - 1);
+    }
+
+    broadcast(buf, sizeof(buf));
+  }
+
   bool EspNowTransport::hasPeer() const
   {
+    if (!_enabled) return false;
     if (!_peerMutex || xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) != pdTRUE)
     {
       return false;

@@ -92,6 +92,7 @@ namespace intercom
     // Set hostname for WiFi
     _wifi.setHostname(deviceName);
     _espNow.setPeerName(deviceName);
+    _espNow.setDeviceName(deviceName);
     _web.setDeviceName(deviceName);
     _web.setTransportManager(this);
 
@@ -106,10 +107,8 @@ namespace intercom
     // Start WiFi in background (may take time)
     _wifi.begin(); // Non-blocking, starts config portal if needed
 
-    // Start web transport (deferred until WiFi connects)
-    Serial.println("[transport] Starting web transport...");
-    _web.begin();
-    Serial.println("[transport] Web transport begin() returned");
+    // Web transport will be started lazily when WiFi connects (in loop())
+    _webInitialized = false;
 
     return espNowOk;
   }
@@ -123,6 +122,56 @@ namespace intercom
     _espNow.poll();
     _wifi.poll();
     _web.poll();
+
+    // Track WiFi connection state changes to enable/disable ESP-NOW
+    bool wifiConnected = _wifi.isConnected();
+    if (wifiConnected != _wifiWasConnected)
+    {
+      if (wifiConnected)
+      {
+        // WiFi connected -> disable ESP-NOW to avoid channel conflict
+        _espNow.setEnabled(false);
+        Serial.println("[transport] WiFi connected, disabling ESP-NOW");
+      }
+      else
+      {
+        // WiFi disconnected -> re-enable ESP-NOW and ensure fixed channel
+        _espNow.setEnabled(true);
+        _espNow.ensureChannel();
+        Serial.println("[transport] WiFi disconnected, enabling ESP-NOW");
+
+        // Restart config portal delay since ESP-NOW is now active again
+        // (ESP-NOW may not have a peer yet, so give it time to discover)
+        _wifi.notifyEspNowPeerStatus(false);
+      }
+      _wifiWasConnected = wifiConnected;
+    }
+
+    // Ensure ESP-NOW channel when WiFi is in STA mode (connecting or connected)
+    // This handles the case where WiFi is trying to connect but not yet connected
+    wifi_mode_t wifiMode = WiFi.getMode();
+    static wifi_mode_t lastWifiMode = WIFI_OFF;
+    if (wifiMode != lastWifiMode)
+    {
+      if (wifiMode == WIFI_STA || wifiMode == WIFI_AP_STA)
+      {
+        // WiFi in STA mode -> ensure ESP-NOW on fixed channel
+        if (_espNow.isEnabled())
+        {
+          _espNow.ensureChannel();
+        }
+      }
+      lastWifiMode = wifiMode;
+    }
+
+    // Track ESP-NOW peer status to coordinate config portal delay
+    static bool lastEspNowPeerStatus = false;
+    bool currentEspNowPeerStatus = _espNow.hasPeer();
+    if (currentEspNowPeerStatus != lastEspNowPeerStatus)
+    {
+      _wifi.notifyEspNowPeerStatus(currentEspNowPeerStatus);
+      lastEspNowPeerStatus = currentEspNowPeerStatus;
+    }
 
     if (_otaPasswordReady)
     {
@@ -153,10 +202,13 @@ namespace intercom
                     WiFi.status(), WiFi.isConnected(), _web.isRunning(), _web.connectedClients());
     }
 
-    // Start web transport if WiFi is connected and web not running
-    if (_wifi.isConnected() && !_web.hasPeer() && !_web.connectedClients())
+    // Start web transport when WiFi connects (lazy initialization)
+    if (_wifi.isConnected() && !_webInitialized)
     {
-      // Web transport starts automatically when WiFi is connected
+      Serial.println("[transport] Starting web transport (WiFi connected)...");
+      _web.begin();
+      _webInitialized = true;
+      Serial.println("[transport] Web transport begin() returned");
     }
 
     // Auto-select best transport
@@ -181,8 +233,11 @@ namespace intercom
 
   void TransportManager::selectBestTransport()
   {
-    // Priority: Web (if clients connected) > WiFi (if peer connected) > ESP-NOW
+    // Priority: Web (if clients connected) > WiFi (if peer connected AND WiFi connected) > ESP-NOW
     size_t webClients = _web.connectedClients();
+    bool wifiConnected = _wifi.isConnected();
+    bool espNowEnabled = _espNow.isEnabled();
+
     if (webClients > 0 && _activeTransport != &_web)
     {
       _activeTransport = &_web;
@@ -197,20 +252,29 @@ namespace intercom
         _transportChangeCb("web");
       Serial.println("[transport] Switched to Web");
     }
-    else if (_wifi.hasPeer() && _activeTransport != &_wifi && _web.connectedClients() == 0)
+    else if (wifiConnected && _wifi.hasPeer() && _activeTransport != &_wifi && _web.connectedClients() == 0)
     {
       _activeTransport = &_wifi;
       if (_transportChangeCb)
         _transportChangeCb("wifi");
       Serial.println("[transport] Switched to WiFi");
     }
-    else if (!_wifi.hasPeer() && !_web.hasPeer() && _activeTransport != &_espNow)
+    else if (espNowEnabled && !wifiConnected && !_web.hasPeer() && _activeTransport != &_espNow)
+    {
+      // No WiFi connection and no web peers -> force ESP-NOW (only if enabled)
+      _activeTransport = &_espNow;
+      if (_transportChangeCb)
+        _transportChangeCb("espnow");
+      Serial.println("[transport] Switched to ESP-NOW (WiFi not connected)");
+    }
+    else if (espNowEnabled && !_wifi.hasPeer() && !_web.hasPeer() && _activeTransport != &_espNow)
     {
       _activeTransport = &_espNow;
       if (_transportChangeCb)
         _transportChangeCb("espnow");
       Serial.println("[transport] Switched to ESP-NOW");
     }
+    // If ESP-NOW is disabled and no other transport has peer, keep current transport
   }
 
   bool TransportManager::tryTransport(Transport *t)

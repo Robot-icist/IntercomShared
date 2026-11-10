@@ -81,10 +81,17 @@ namespace intercom
       }
     }
 
-    // Start config portal
-    Serial.println("[wifi] No credentials, starting config portal");
-    startConfigPortal();
-    return true; // Config portal is running
+    // No credentials - stay in STA mode for ESP-NOW discovery
+    // Delay config portal (AP mode) to allow ESP-NOW to find peers
+    Serial.println("[wifi] No credentials, staying in STA mode for ESP-NOW discovery");
+    Serial.printf("[wifi] Config portal will start in %lu seconds if no peer found\n",
+                  kConfigPortalDelayMs / 1000);
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    _configPortalStartMs = millis();
+    _configPortalDelayActive = true;
+    _running = true; // Running in STA mode for ESP-NOW
+    return true;
   }
 
   void WiFiTransport::end()
@@ -210,6 +217,19 @@ namespace intercom
 
   bool WiFiTransport::poll()
   {
+    // Check if config portal delay has expired and start config portal
+    if (_configPortalDelayActive && !_wifiConnected && !_inConfigMode)
+    {
+      uint32_t now = millis();
+      if (now - _configPortalStartMs >= kConfigPortalDelayMs)
+      {
+        Serial.println("[wifi] Config portal delay expired, starting AP mode");
+        _configPortalDelayActive = false;
+        startConfigPortal();
+        return true;
+      }
+    }
+
     if (!_wifiConnected || !_running)
     {
       // Try to reconnect if we have credentials
@@ -226,6 +246,12 @@ namespace intercom
         }
       }
       return false;
+    }
+
+    // Clear config portal delay once WiFi is connected
+    if (_wifiConnected)
+    {
+      _configPortalDelayActive = false;
     }
 
     // Send periodic discovery
@@ -253,6 +279,10 @@ namespace intercom
 
   bool WiFiTransport::hasPeer() const
   {
+    if (!_wifiConnected)
+    {
+      return false;
+    }
     if (!_peerMutex || xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) != pdTRUE)
     {
       return false;
@@ -464,11 +494,38 @@ namespace intercom
     xSemaphoreGive(_peerMutex);
   }
 
+  // ESP-NOW peer coordination - called by TransportManager
+  void WiFiTransport::notifyEspNowPeerStatus(bool hasPeer)
+  {
+    if (hasPeer)
+    {
+      // ESP-NOW has a peer - cancel config portal delay
+      if (_configPortalDelayActive)
+      {
+        Serial.println("[wifi] ESP-NOW peer found, cancelling config portal delay");
+        _configPortalDelayActive = false;
+      }
+    }
+    else
+    {
+      // ESP-NOW lost peer - restart config portal delay if not in config mode and not connected
+      if (!_inConfigMode && !_wifiConnected && !_configPortalDelayActive)
+      {
+        Serial.println("[wifi] ESP-NOW peer lost, restarting config portal delay");
+        _configPortalStartMs = millis();
+        _configPortalDelayActive = true;
+      }
+    }
+  }
+
   // WiFi Configuration
   bool WiFiTransport::connectToWiFi(const char *ssid, const char *pass, uint32_t timeoutMs)
   {
     if (!ssid || strlen(ssid) == 0)
       return false;
+
+    // Clear config portal delay when attempting connection
+    _configPortalDelayActive = false;
 
     WiFi.mode(WIFI_STA);
     WiFi.begin(ssid, pass);
@@ -489,6 +546,7 @@ namespace intercom
 
   void WiFiTransport::startConfigPortal()
   {
+    _configPortalDelayActive = false; // Clear delay when explicitly starting
     _inConfigMode = true;
     WiFi.mode(WIFI_AP);
 

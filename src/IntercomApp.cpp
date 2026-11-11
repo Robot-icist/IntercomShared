@@ -1650,6 +1650,7 @@ void IntercomApp::fillPeerUi(UiState& s) const {
   int count = 0;
   int selected = 0;
   int first = -1;
+  int8_t firstOnlineRssi = 0;  // Track RSSI of first online peer in selection
   for (size_t i = 0; i < kMaxPeers; ++i) {
     if (!_peers[i].used) {
       continue;
@@ -1662,6 +1663,9 @@ void IntercomApp::fillPeerUi(UiState& s) const {
       }
       if (_peers[i].online) {
         s.peerOnline = true;
+        if (firstOnlineRssi == 0) {
+          firstOnlineRssi = _peers[i].rssi;
+        }
       }
     }
   }
@@ -1722,6 +1726,12 @@ void IntercomApp::fillPeerUi(UiState& s) const {
     }
   } else {
     snprintf(s.peerName, sizeof(s.peerName), "%d PEERS", selected);
+  }
+
+  // Fallback: if peer is online but RSSI wasn't set in the branches above,
+  // use the RSSI of the first online peer in the selection.
+  if (s.peerOnline && s.peerRssi == 0 && firstOnlineRssi != 0) {
+    s.peerRssi = firstOnlineRssi;
   }
 
   s.peerName[sizeof(s.peerName) - 1] = 0;

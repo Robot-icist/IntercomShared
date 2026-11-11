@@ -342,7 +342,12 @@ namespace intercom
     {
       return;
     }
-    int8_t rssi = info->rx_ctrl ? (int8_t)info->rx_ctrl->rssi : 0;
+    // Only update RSSI if rx_ctrl is available; otherwise keep last known value.
+    int8_t rssi = 0;
+    if (info->rx_ctrl)
+    {
+      rssi = (int8_t)info->rx_ctrl->rssi;
+    }
     g_instance->handlePacket(info->src_addr, rssi, data, len);
   }
 

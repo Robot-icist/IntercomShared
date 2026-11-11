@@ -151,7 +151,11 @@ void EspNowLink::onRecv(const esp_now_recv_info_t* info, const uint8_t* data, in
   if (!g_link || !info || !info->src_addr || !data || len <= 0) {
     return;
   }
-  int8_t rssi = info->rx_ctrl ? (int8_t)info->rx_ctrl->rssi : 0;
+  // Only update RSSI if rx_ctrl is available; otherwise keep last known value.
+  int8_t rssi = 0;
+  if (info->rx_ctrl) {
+    rssi = (int8_t)info->rx_ctrl->rssi;
+  }
   g_link->handlePacket(info->src_addr, rssi, data, len);
 }
 

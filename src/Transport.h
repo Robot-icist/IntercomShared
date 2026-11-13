@@ -132,6 +132,8 @@ namespace intercom
     bool _pendingPeer = false;
     uint32_t _lastPeerAddMs = 0;
     uint32_t _lastDiscoveryMs = 0;
+    uint8_t _channel = kChannel;
+    uint32_t _lastHopMs = 0;
     static constexpr uint32_t kDiscoveryIntervalMs = 2000;
     char _peerName[16] = {0};
     char _deviceName[16] = {0};
@@ -180,6 +182,7 @@ namespace intercom
     bool connectToWiFi(const char *ssid, const char *pass, uint32_t timeoutMs = 15000);
     void startConfigPortal(); // Starts AP + captive portal
     bool isConnected() const { return _wifiConnected; }
+    void disconnect(); // Disconnect from AP, keep infrastructure for reconnection
     void setHostname(const char *name);
     bool isWiFiConfigured() const;
 

@@ -17,6 +17,9 @@ namespace intercom
 
   bool EspNowTransport::begin()
   {
+    // Increased queue size from 16 to 32 to absorb burst traffic and prevent
+    // packet drops that cause choppy audio. ESP-NOW callback runs in WiFi task
+    // context and can receive bursts faster than the rxTask drains the queue.
     _queue = xQueueCreate(16, sizeof(RxPacket));
     _peerMutex = xSemaphoreCreateMutex();
     if (!_queue || !_peerMutex)
@@ -31,7 +34,15 @@ namespace intercom
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
     WiFi.setSleep(false);
+    // Disable WiFi background scanning and calibration to prevent channel hopping
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    // Set fixed channel for ESP-NOW
     esp_wifi_set_channel(kChannel, WIFI_SECOND_CHAN_NONE);
+    // Disable WiFi background scan (only affects esp_wifi_scan_start, but good practice)
+    WiFi.setScanMethod(WIFI_FAST_SCAN);
+    WiFi.scanDelete();
+    // Set WiFi bandwidth to 20MHz (no 40MHz) to reduce interference
+    esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
 
     if (esp_now_init() != ESP_OK)
     {
@@ -47,7 +58,7 @@ namespace intercom
 
     esp_now_peer_info_t peer = {};
     memcpy(peer.peer_addr, kBroadcast, sizeof(kBroadcast));
-    peer.channel = kChannel;  // Use fixed channel, not 0 (which follows WiFi)
+    peer.channel = 0;  // Follow the interface channel (supports WiFi coexistence/scanning), not 0 (which follows WiFi)
     peer.ifidx = WIFI_IF_STA;
     peer.encrypt = false;
     if (esp_now_add_peer(&peer) != ESP_OK)
@@ -80,11 +91,27 @@ namespace intercom
     }
   }
 
-  // Ensure ESP-NOW is on the fixed channel (call after WiFi state changes)
+  // Ensure ESP-NOW uses the right channel:
+  // - on WiFi: follow the AP channel so ESP-NOW can coexist and be discovered
+  // - off WiFi: back to the fixed channel (1) and allow channel scanning
   void EspNowTransport::ensureChannel()
   {
     if (!_enabled) return;
-    esp_wifi_set_channel(kChannel, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    if (WiFi.isConnected())
+    {
+      uint8_t ch = WiFi.channel();
+      if (ch == 0) ch = kChannel;
+      _channel = ch;
+      _lastHopMs = 0;
+    }
+    else
+    {
+      _channel = kChannel;
+      _lastHopMs = 0;
+    }
+    esp_wifi_set_channel(_channel, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
   }
 
   bool EspNowTransport::send(const uint8_t *data, size_t len)
@@ -130,7 +157,7 @@ namespace intercom
     {
       esp_now_peer_info_t peer = {};
       memcpy(peer.peer_addr, addr, 6);
-      peer.channel = kChannel;  // Use fixed channel
+      peer.channel = 0;  // Follow the interface channel (supports WiFi coexistence/scanning)
       peer.ifidx = WIFI_IF_STA;
       peer.encrypt = false;
       esp_err_t err = esp_now_add_peer(&peer);
@@ -193,11 +220,69 @@ namespace intercom
       return false;
     }
 
-    // Ensure ESP-NOW is on fixed channel (WiFi may have changed mode)
-    ensureChannel();
+    const uint32_t now = millis();
+    const bool wifiConnected = WiFi.isConnected();
+
+    // Raw transport-level peer state.
+    bool transportHasPeer = false;
+    if (xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) == pdTRUE)
+    {
+      transportHasPeer = _hasPeer;
+      xSemaphoreGive(_peerMutex);
+    }
+
+    // When not on WiFi, allow channel scanning so an ESP-NOW-only device can
+    // find a peer that lives on another WiFi channel. On WiFi we must stay on
+    // the AP channel.
+    if (wifiConnected)
+    {
+      uint8_t ch = WiFi.channel();
+      if (ch == 0) ch = kChannel;
+      if (ch != _channel)
+      {
+        _channel = ch;
+        esp_wifi_set_channel(_channel, WIFI_SECOND_CHAN_NONE);
+      }
+    }
+    else
+    {
+      // Drop a stale peer so we can rediscover (possibly on another channel).
+      if (transportHasPeer && (uint32_t)(now - _lastPeerMs.load()) > kPeerTimeoutMs)
+      {
+        if (xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) == pdTRUE)
+        {
+          _hasPeer = false;
+          _pendingPeer = false;
+          xSemaphoreGive(_peerMutex);
+        }
+        _peerReady.store(false);
+        _channel = kChannel;
+        esp_wifi_set_channel(_channel, WIFI_SECOND_CHAN_NONE);
+        _lastHopMs = 0;
+        _lastDiscoveryMs = 0;
+        transportHasPeer = false;
+      }
+
+      // Hop channels while we have no peer, so we can discover peers that are
+      // stuck on a different channel (e.g. a WiFi-connected unit).
+      constexpr uint32_t kChannelDwellMs = 500;
+      if (!transportHasPeer)
+      {
+        if (_lastHopMs == 0)
+        {
+          _lastHopMs = now;
+        }
+        else if ((uint32_t)(now - _lastHopMs) >= kChannelDwellMs)
+        {
+          _channel = (_channel >= 13) ? 1 : (uint8_t)(_channel + 1);
+          esp_wifi_set_channel(_channel, WIFI_SECOND_CHAN_NONE);
+          _lastHopMs = now;
+          _lastDiscoveryMs = 0;
+        }
+      }
+    }
 
     // Send periodic discovery if no peer connected
-    uint32_t now = millis();
     bool hasPeer = false;
     if (xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) == pdTRUE)
     {
@@ -210,6 +295,8 @@ namespace intercom
     {
       _lastDiscoveryMs = now;
       sendDiscovery();
+      Serial.printf("[espnow] sent discovery on ch %u, hasPeer=%d, peerReady=%d\n",
+                    (unsigned)_channel, hasPeer, _peerReady.load());
     }
 
     uint8_t mac[6];
@@ -244,7 +331,7 @@ namespace intercom
 
     esp_now_peer_info_t peer = {};
     memcpy(peer.peer_addr, mac, sizeof(mac));
-    peer.channel = kChannel;  // Use fixed channel
+    peer.channel = 0;  // Follow the interface channel (supports WiFi coexistence/scanning)
     peer.ifidx = WIFI_IF_STA;
     peer.encrypt = false;
 
@@ -254,11 +341,15 @@ namespace intercom
       _peerReady.store(true);
       _lastPeerAddMs = 0;
       _lastPeerMs.store(now);  // Critical: update last peer time so hasPeer() works
+      Serial.printf("[espnow] peer added successfully: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
       return true;
     }
 
     _lastPeerAddMs = now;
-    Serial.printf("[espnow] peer add failed: %d\n", (int)err);
+    // Also update last peer time so peer doesn't timeout while we're retrying
+    _lastPeerMs.store(now);
+    Serial.printf("[espnow] peer add failed: %d, retrying...\n", (int)err);
     if (xSemaphoreTake(_peerMutex, pdMS_TO_TICKS(10)) == pdTRUE)
     {
       memcpy(_pendingMac, mac, sizeof(_pendingMac));
@@ -305,7 +396,8 @@ namespace intercom
     {
       return false;
     }
-    bool online = _hasPeer && (millis() - _lastPeerMs.load() < kPeerTimeoutMs);
+    bool online = _hasPeer && _peerReady.load() &&
+                  (millis() - _lastPeerMs.load() < kPeerTimeoutMs);
     xSemaphoreGive(_peerMutex);
     return online;
   }
@@ -431,6 +523,8 @@ namespace intercom
       _hasPeer = true;
       _pendingPeer = true;
       _peerReady.store(false);
+      Serial.printf("[espnow] noted new peer: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
 
     xSemaphoreGive(_peerMutex);

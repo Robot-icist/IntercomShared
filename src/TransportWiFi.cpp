@@ -126,6 +126,28 @@ namespace intercom
     _hasPeer = false;
   }
 
+  // Disconnect from WiFi AP but keep transport infrastructure alive for reconnection
+  void WiFiTransport::disconnect()
+  {
+    if (!_wifiConnected)
+      return;
+
+    Serial.println("[wifi] Disconnecting from AP");
+    stopMDNS();
+    if (_udpTask)
+    {
+      vTaskDelete(_udpTask);
+      _udpTask = nullptr;
+    }
+    _udp.stop();
+    WiFi.disconnect(true);
+    // Stay in STA mode for ESP-NOW coexistence
+    WiFi.mode(WIFI_STA);
+    _wifiConnected = false;
+    _hasPeer = false;
+    _peerReady.store(false);
+  }
+
   bool WiFiTransport::send(const uint8_t *data, size_t len)
   {
     if (!data || len == 0 || len > kMaxPacketSize || !_hasPeer || !_wifiConnected)

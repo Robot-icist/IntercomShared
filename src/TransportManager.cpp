@@ -129,16 +129,19 @@ namespace intercom
     {
       if (wifiConnected)
       {
-        // WiFi connected -> disable ESP-NOW to avoid channel conflict
-        _espNow.setEnabled(false);
-        Serial.println("[transport] WiFi connected, disabling ESP-NOW");
+        // WiFi connected -> keep ESP-NOW active on the AP channel so a
+        // WiFi-connected unit can still be discovered by ESP-NOW peers.
+        _espNow.setEnabled(true);
+        _espNow.ensureChannel();
+        Serial.println("[transport] WiFi connected, ESP-NOW coexists on WiFi channel");
       }
       else
       {
-        // WiFi disconnected -> re-enable ESP-NOW and ensure fixed channel
+        // WiFi disconnected -> ESP-NOW back on the fixed channel (1) for
+        // ESP-NOW-only peers.
         _espNow.setEnabled(true);
         _espNow.ensureChannel();
-        Serial.println("[transport] WiFi disconnected, enabling ESP-NOW");
+        Serial.println("[transport] WiFi disconnected, ESP-NOW on fixed channel");
 
         // Restart config portal delay since ESP-NOW is now active again
         // (ESP-NOW may not have a peer yet, so give it time to discover)
@@ -237,6 +240,8 @@ namespace intercom
     size_t webClients = _web.connectedClients();
     bool wifiConnected = _wifi.isConnected();
     bool espNowEnabled = _espNow.isEnabled();
+    bool espNowHasPeer = _espNow.hasPeer();
+    bool wifiHasPeer = _wifi.hasPeer();
 
     if (webClients > 0 && _activeTransport != &_web)
     {
@@ -252,7 +257,7 @@ namespace intercom
         _transportChangeCb("web");
       Serial.println("[transport] Switched to Web");
     }
-    else if (wifiConnected && _wifi.hasPeer() && _activeTransport != &_wifi && _web.connectedClients() == 0)
+    else if (wifiConnected && wifiHasPeer && _activeTransport != &_wifi && _web.connectedClients() == 0)
     {
       _activeTransport = &_wifi;
       if (_transportChangeCb)
@@ -267,12 +272,23 @@ namespace intercom
         _transportChangeCb("espnow");
       Serial.println("[transport] Switched to ESP-NOW (WiFi not connected)");
     }
-    else if (espNowEnabled && !_wifi.hasPeer() && !_web.hasPeer() && _activeTransport != &_espNow)
+    else if (espNowEnabled && !wifiHasPeer && !_web.hasPeer() && _activeTransport != &_espNow)
     {
       _activeTransport = &_espNow;
       if (_transportChangeCb)
         _transportChangeCb("espnow");
       Serial.println("[transport] Switched to ESP-NOW");
+    }
+    // If WiFi is connected but has NO peer, while ESP-NOW HAS a peer, just prefer
+    // ESP-NOW for sending. Keep WiFi connected (and ESP-NOW on its channel) so the
+    // link is not broken and discovery keeps working.
+    else if (wifiConnected && !wifiHasPeer && espNowHasPeer &&
+             _activeTransport != &_espNow)
+    {
+      _activeTransport = &_espNow;
+      if (_transportChangeCb)
+        _transportChangeCb("espnow");
+      Serial.println("[transport] WiFi has no peer, ESP-NOW has peer -> using ESP-NOW");
     }
     // If ESP-NOW is disabled and no other transport has peer, keep current transport
   }

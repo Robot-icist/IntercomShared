@@ -101,7 +101,15 @@ and defines one board flag:
 `IntercomConfig.h` uses those flags to select the audio port sharing policy and
 the UI canvas memory type.
 
+## Transport and web intercom
+
+Audio can travel over ESP-NOW or local Wi-Fi. A unit connected to Wi-Fi and a
+unit using only ESP-NOW can still communicate; the transport manager
+coordinates peers across both.
+
 ## Web intercom
+
+![Intercom web client](./screenshots/intercom-web-client.png)
 
 When Wi-Fi is connected, the device serves the web client over HTTPS on port
 443. Open `https://<device-name>-web.local/` (or the device's HTTPS IP address)
